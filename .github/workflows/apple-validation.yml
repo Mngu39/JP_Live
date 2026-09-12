@@ -25,6 +25,7 @@ jobs:
           path: |
             BuildOutputs/**/toolchain.txt
             BuildOutputs/**/source-SHA256SUMS.txt
+            BuildOutputs/**/source-SHA256SUMS.original.txt
             BuildOutputs/**/simulators.json
             BuildOutputs/**/*.log
             BuildOutputs/**/*.xcresult
