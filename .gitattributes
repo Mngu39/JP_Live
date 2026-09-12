@@ -1,0 +1,10 @@
+# Checksums describe exact file bytes. Prevent platform-default EOL rewriting.
+* -text
+
+# Build/CI text has a declared LF representation on every platform.
+.gitattributes text eol=lf
+SHA256SUMS.txt text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
