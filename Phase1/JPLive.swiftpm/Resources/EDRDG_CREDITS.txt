@@ -1,0 +1,9 @@
+JP Translator uses derived data from JMdict and KANJIDIC2 by the Electronic Dictionary Research and Development Group (EDRDG).
+
+Sources:
+- JMdict_e: https://www.edrdg.org/jmdict/j_jmdict.html
+- KANJIDIC2: https://www.edrdg.org/kanjidic/kanjd2index_legacy.html
+
+The source dictionary files are copyright EDRDG and are distributed under the EDRDG licence / Creative Commons Attribution-ShareAlike 4.0 terms described by EDRDG.
+Licence: https://www.edrdg.org/edrdg/licence.html
+This project stores only a compact derived index of Japanese readings and selected common example spellings/readings for its learning UI.

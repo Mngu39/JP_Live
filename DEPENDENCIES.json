@@ -1,0 +1,50 @@
+{
+  "FluidAudio": {
+    "revision": "5c19d5e12320e22bbfb7a1877b089d2665a69add",
+    "swiftTools": "6.0",
+    "phase": 2,
+    "phase1": "Removed after user-reported Playgrounds archive validation failure: could not find executable for 'unzip'",
+    "requiredBinaryTarget": "NemoTextProcessing",
+    "binaryURL": "https://github.com/FluidInference/text-processing-rs/releases/download/v0.3.0/NemoTextProcessing.xcframework.zip",
+    "manifest": "https://github.com/FluidInference/FluidAudio/blob/5c19d5e12320e22bbfb7a1877b089d2665a69add/Package.swift"
+  },
+  "DeepFilterNet": {
+    "revision": "c6c4b9dc98c62bfa90ed66c5fd4f5d54e88c7b4f",
+    "swiftTools": "6.2",
+    "phase": 2,
+    "coreMLTargetDependencies": ["DeepFilterNetMLX", "MLX", "HuggingFace"],
+    "packageDependencies": {
+      "mlx-swift": ">=0.30.6 <1.0.0",
+      "swift-huggingface": ">=0.6.0 <1.0.0",
+      "swift-argument-parser": ">=1.5.0 <2.0.0"
+    },
+    "runtimeModels": "automatic source: prefer bundled models, otherwise download Hugging Face snapshot",
+    "manifest": "https://github.com/kylehowells/DeepFilterNet-mlx/blob/c6c4b9dc98c62bfa90ed66c5fd4f5d54e88c7b4f/Package.swift"
+  },
+  "Sudachi": {
+    "revision": "90fd6068c80c2fc3b63e0dbab0e341475bad4d8f",
+    "status": "Rust bridge source; native binary and dictionary not bundled"
+  },
+  "separator": {
+    "status": "experimental exporter; no weights bundled"
+  },
+  "Phase1": {
+    "externalSwiftPackages": [],
+    "remoteBinaryTargets": [],
+    "buildToolPlugins": [],
+    "diarization": "disabled only for the tested Playgrounds host limitation; retained in Phase 2",
+    "runtimeAssets": ["Apple Speech ja-JP/en-US", "Apple Translation source language to ko"],
+    "lastUserReportedBuild": {
+      "dependencyResolution": "passed after external packages removed",
+      "compile": "failed with three LanguageTools diagnostics: CFLocaleIdentifier, StringTransform inference, Bundle.module",
+      "runtime": "not reached"
+    },
+    "newResolveCompileRun": "NOT RUN for the current LanguageTools/resource-loading fix"
+  },
+  "Phase2Resolution": {
+    "status": "NOT RUN; transitive versions are not yet resolved or locked",
+    "preserve": "Phase2/JPLive.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+    "archiveCopy": "BuildOutputs/Package.resolved",
+    "policy": "Preserve the actual first successful Xcode resolution in the project; use -disableAutomaticPackageResolution for archive; do not invent a lockfile"
+  }
+}

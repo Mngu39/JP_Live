@@ -1,0 +1,395 @@
+{
+  "date": "2026-09-08",
+  "scope": "Automated syntax/project/dependency/startup source checks only; no Apple compile, SDK resolution or native test execution",
+  "syntax": {
+    "swift": {
+      "files": 35,
+      "errors": []
+    },
+    "rust": {
+      "files": 1,
+      "errors": []
+    },
+    "python": {
+      "files": 1,
+      "errors": []
+    },
+    "bash": {
+      "files": 2,
+      "errors": []
+    }
+  },
+  "checks": [
+    {
+      "name": "all source syntax trees",
+      "status": "PASS"
+    },
+    {
+      "name": "Xcode source and resource references exist",
+      "status": "PASS"
+    },
+    {
+      "name": "all Shared Swift files have target membership",
+      "status": "PASS"
+    },
+    {
+      "name": "Playground copies match canonical sources and resources",
+      "status": "PASS"
+    },
+    {
+      "name": "iOS capture capability and test host",
+      "status": "PASS"
+    },
+    {
+      "name": "scheme target IDs resolve",
+      "status": "PASS"
+    },
+    {
+      "name": "Japanese dictionaries match Swift string-map schema",
+      "status": "PASS"
+    },
+    {
+      "name": "build scripts have Unix line endings",
+      "status": "PASS"
+    },
+    {
+      "name": "Phase 1 has no external package, product, binary or build-tool dependency",
+      "status": "PASS"
+    },
+    {
+      "name": "Phase 2 retains pinned optional packages and records transitive graph",
+      "status": "PASS"
+    },
+    {
+      "name": "Optional preparation follows basic input and cannot mutate the pipeline from completion",
+      "status": "PASS"
+    },
+    {
+      "name": "Late provider wiring preserves activation boundaries",
+      "status": "PASS"
+    },
+    {
+      "name": "Archive script preserves actual Package.resolved",
+      "status": "PASS"
+    }
+  ],
+  "runner": {
+    "runtime": "v24.18.0",
+    "arguments": [
+      "--no-opt",
+      "--liftoff-only",
+      "work/review-static.cjs"
+    ]
+  },
+  "prebuildRevision": {
+    "date": "2026-09-08",
+    "change": "speaker-change-gain-reset",
+    "scope": "Only requested known single-speaker gain carryover fix; no new full audit.",
+    "syntax": {
+      "parser": "tree-sitter",
+      "files": [
+        "Shared/Audio.swift",
+        "Phase1/JPLive.swiftpm/Sources/Audio.swift",
+        "Shared/AudioPipeline.swift",
+        "Phase1/JPLive.swiftpm/Sources/AudioPipeline.swift",
+        "Tests/CoreTests.swift"
+      ],
+      "errors": []
+    },
+    "matchingCopies": [
+      "Shared/App.swift",
+      "Shared/AppModel.swift",
+      "Shared/Audio.swift",
+      "Shared/AudioPipeline.swift",
+      "Shared/Core.swift",
+      "Shared/LanguageTools.swift",
+      "Shared/ModelAdapters.swift",
+      "Shared/RubyText.swift",
+      "Shared/Separation.swift",
+      "Shared/Settings.swift",
+      "Shared/SpeechTimeline.swift",
+      "Shared/StudyPopup.swift",
+      "Shared/SudachiRuntime.swift",
+      "Shared/TranscriptBuffer.swift",
+      "Shared/TranslationBacklog.swift",
+      "Shared/WorkerClient.swift",
+      "Resources/deck-index.json",
+      "Resources/deck.json",
+      "Resources/EDRDG_CREDITS.txt",
+      "Resources/kanji_ko_attr_irreg.min.json"
+    ],
+    "sourceWiringChecks": "PASS (source assertions, not behavior execution)",
+    "xctest": {
+      "sourceTests": 50,
+      "newlyAdded": 2,
+      "executed": 0
+    },
+    "appleCompile": "NOT RUN",
+    "iPadExecution": "NOT RUN",
+    "runner": {
+      "runtime": "v24.18.0",
+      "arguments": [
+        "--no-opt",
+        "--liftoff-only",
+        "work/check-prebuild.cjs"
+      ]
+    }
+  },
+  "previousPrebuildRevision": {
+    "date": "2026-09-08",
+    "scope": "Only requested mixed gain and soft gutter changes; prior full audit above was not repeated.",
+    "syntax": {
+      "parser": "tree-sitter",
+      "files": [
+        "Shared/Audio.swift",
+        "Phase1/JPLive.swiftpm/Sources/Audio.swift",
+        "Shared/AudioPipeline.swift",
+        "Phase1/JPLive.swiftpm/Sources/AudioPipeline.swift",
+        "Shared/Core.swift",
+        "Phase1/JPLive.swiftpm/Sources/Core.swift",
+        "Shared/SpeechTimeline.swift",
+        "Phase1/JPLive.swiftpm/Sources/SpeechTimeline.swift",
+        "Shared/AppModel.swift",
+        "Phase1/JPLive.swiftpm/Sources/AppModel.swift",
+        "Shared/App.swift",
+        "Phase1/JPLive.swiftpm/Sources/App.swift",
+        "Tests/CoreTests.swift"
+      ],
+      "errors": []
+    },
+    "matchingCopies": [
+      "Shared/App.swift",
+      "Shared/AppModel.swift",
+      "Shared/Audio.swift",
+      "Shared/AudioPipeline.swift",
+      "Shared/Core.swift",
+      "Shared/LanguageTools.swift",
+      "Shared/ModelAdapters.swift",
+      "Shared/RubyText.swift",
+      "Shared/Separation.swift",
+      "Shared/Settings.swift",
+      "Shared/SpeechTimeline.swift",
+      "Shared/StudyPopup.swift",
+      "Shared/SudachiRuntime.swift",
+      "Shared/TranscriptBuffer.swift",
+      "Shared/TranslationBacklog.swift",
+      "Shared/WorkerClient.swift",
+      "Resources/deck-index.json",
+      "Resources/deck.json",
+      "Resources/EDRDG_CREDITS.txt",
+      "Resources/kanji_ko_attr_irreg.min.json"
+    ],
+    "sourceWiringChecks": "PASS (source assertions, not behavior execution)",
+    "xctest": {
+      "sourceTests": 48,
+      "newlyAdded": 9,
+      "executed": 0
+    },
+    "appleCompile": "NOT RUN",
+    "iPadExecution": "NOT RUN",
+    "runner": {
+      "runtime": "v24.18.0",
+      "arguments": [
+        "--no-opt",
+        "--liftoff-only",
+        "work/check-prebuild.cjs"
+      ]
+    }
+  },
+  "dependencyRevision": {
+    "date": "2026-09-08",
+    "checks": 13,
+    "externalPhase1Packages": 0,
+    "phase2PinsRetained": true,
+    "xctest": {
+      "sourceTests": 54,
+      "newlyAdded": 4,
+      "executed": 0
+    },
+    "appleCompile": "NOT RUN",
+    "updatedPlaygroundsResolve": "NOT RUN",
+    "priorUserReportedError": "Failed validating archive from 'https://github.com/FluidInference/text-processing-rs/releases/download/v0.3.0/NemoTextProcessing.xcframework.zip' which is required by binary target 'NemoTextProcessing': could not find executable for 'unzip'",
+    "phase2PackageResolved": "Not generated; requires first successful Xcode resolution"
+  },
+  "languageToolsRevision": {
+    "date": "2026-09-08",
+    "deliveryDate": "2026-09-09",
+    "scopeVerification": {
+      "date": "2026-09-09",
+      "onlySwiftChanges": [
+        "Shared/LanguageTools.swift",
+        "Shared/Settings.swift",
+        "Phase1/JPLive.swiftpm/Sources/LanguageTools.swift",
+        "Phase1/JPLive.swiftpm/Sources/Settings.swift",
+        "Tests/CoreTests.swift"
+      ],
+      "projectManifestAndOriginalResourcesUnchanged": true,
+      "comparedWithArchiveSHA256": "f1dd742958be4f07a2fcb8e800a1766ff7cc6c050e10cb5b13b363457db1f596"
+    },
+    "scope": "Three user-reported LanguageTools compiler diagnostics and visible resource loading check only",
+    "syntax": {
+      "parser": "tree-sitter",
+      "files": [
+        "Shared/LanguageTools.swift",
+        "Phase1/JPLive.swiftpm/Sources/LanguageTools.swift",
+        "Shared/Settings.swift",
+        "Phase1/JPLive.swiftpm/Sources/Settings.swift",
+        "Tests/CoreTests.swift"
+      ],
+      "errors": []
+    },
+    "sharedCopies": 16,
+    "resources": [
+      {
+        "file": "deck-index.json",
+        "sourceEntries": 2306,
+        "phase1CopyMatch": true,
+        "phase2ResourceMembership": true
+      },
+      {
+        "file": "kanji_ko_attr_irreg.min.json",
+        "sourceEntries": 5663,
+        "phase1CopyMatch": true,
+        "phase2ResourceMembership": true
+      }
+    ],
+    "sourceWiring": "PASS; not a Swift type check or runtime bundle test",
+    "priorUserBuild": {
+      "dependencyResolution": "passed per user report",
+      "compile": "failed: CFLocaleIdentifier, StringTransform inference, Bundle.module",
+      "runtime": "not reached"
+    },
+    "updatedAppleCompile": "NOT RUN",
+    "actualRuntimeJSONLoad": "NOT RUN",
+    "xctest": {
+      "sourceTests": 55,
+      "newlyAdded": 1,
+      "executed": 0
+    },
+    "runner": {
+      "runtime": "v24.18.0",
+      "arguments": [
+        "--no-opt",
+        "--liftoff-only",
+        "work/check-language-compile.cjs"
+      ]
+    }
+  },
+  "audioTimelineRevision": {
+    "id": "audio-timeline-2026-09-10",
+    "date": "2026-09-10",
+    "scope": "Source syntax, project membership and wiring checks; NOT Apple compile/runtime tests",
+    "syntax": {
+      "swift": {
+        "files": 38,
+        "errors": []
+      },
+      "rust": {
+        "files": 1,
+        "errors": []
+      },
+      "python": {
+        "files": 2,
+        "errors": []
+      }
+    },
+    "checks": [
+      {
+        "name": "all source syntax trees",
+        "status": "PASS"
+      },
+      {
+        "name": "Xcode source and resource references exist",
+        "status": "PASS"
+      },
+      {
+        "name": "all Shared Swift files have target membership",
+        "status": "PASS"
+      },
+      {
+        "name": "Playground copies match canonical sources and resources",
+        "status": "PASS"
+      },
+      {
+        "name": "iOS capture capability and test host",
+        "status": "PASS"
+      },
+      {
+        "name": "scheme target IDs resolve",
+        "status": "PASS"
+      },
+      {
+        "name": "Japanese dictionaries match Swift string-map schema",
+        "status": "PASS"
+      },
+      {
+        "name": "build scripts have Unix line endings",
+        "status": "PASS"
+      },
+      {
+        "name": "Phase 1 has no external package, product, binary or build-tool dependency",
+        "status": "PASS"
+      },
+      {
+        "name": "Phase 2 retains pinned optional packages and records transitive graph",
+        "status": "PASS"
+      },
+      {
+        "name": "Optional preparation follows basic input and cannot mutate the pipeline from completion",
+        "status": "PASS"
+      },
+      {
+        "name": "Late provider wiring preserves activation boundaries",
+        "status": "PASS"
+      },
+      {
+        "name": "Archive script preserves actual Package.resolved",
+        "status": "PASS"
+      },
+      {
+        "name": "Phase 1 Xcode has no external dependencies and uses the Phase 1 compile branch",
+        "status": "PASS"
+      },
+      {
+        "name": "Both Xcode targets compile the new converter and regression suite",
+        "status": "PASS"
+      },
+      {
+        "name": "Converter API availability, EOF and sample clocks are explicit",
+        "status": "PASS"
+      }
+    ],
+    "xctest": {
+      "sourceTests": 72,
+      "newlyAdded": 17,
+      "executed": 0
+    },
+    "userReportedBaseline": {
+      "dependencyResolution": "PASS",
+      "appleCompile": "PASS",
+      "appLaunch": "PASS",
+      "fileImport": "PASS",
+      "sttPreparation": "PASS",
+      "sttStreaming": "FAIL: Audio input timestamp overlaps or precedes prior audio input"
+    },
+    "updatedAppleCompile": "NOT RUN",
+    "updatedXCTest": "NOT RUN",
+    "updatedIPadRuntime": "NOT RUN",
+    "ci": "Prepared locally; no repository upload or workflow dispatch",
+    "runner": {
+      "runtime": "v24.18.0",
+      "arguments": [
+        "--no-opt",
+        "--liftoff-only",
+        "work/check-audio.cjs"
+      ]
+    },
+    "toolScriptChecks": {
+      "simulatorSelectionFixtureRuns": 3,
+      "result": "PASS",
+      "pythonCompile": "PASS (2 files; standard Python compiler)",
+      "bashAndYamlSyntax": "NOT VERIFIED: local tree-sitter WASM modules raised TypeError: resolved is not a function",
+      "appleBuildScriptExecution": "NOT RUN"
+    }
+  }
+}

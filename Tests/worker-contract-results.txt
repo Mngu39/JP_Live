@@ -1,0 +1,11 @@
+PASS unauthenticated issuance rejects (existing dispatcher does not await)
+PASS existing APP_TOKEN issues 24h log token
+PASS Japanese lemma goes to existing DeepL endpoint
+PASS English popup translation uses EN
+PASS no image or bbox required for sentence save
+PASS word ranges and explicit group retained
+PASS missing word rejects at handler
+PASS tampered log token rejects at handler
+PASS expired token rejects at handler
+PASS AI restructure shares existing route and emits UTF16 ranges
+{"passed":10,"liveRequests":0,"productionWrites":0}

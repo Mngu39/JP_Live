@@ -1,0 +1,16 @@
+[package]
+name = "jp_sudachi_bridge"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "SudachiBridge"
+crate-type = ["staticlib"]
+
+[dependencies]
+sudachi = { git = "https://github.com/WorksApplications/sudachi.rs", rev = "90fd6068c80c2fc3b63e0dbab0e341475bad4d8f" }
+serde_json = "1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,4 @@
+module SudachiBridge {
+    header "SudachiBridge.h"
+    export *
+}
