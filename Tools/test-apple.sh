@@ -13,12 +13,16 @@ if [[ "${SDK_VERSION%%.*}" -lt "$MIN_SDK" ]]; then
   exit 1
 fi
 mkdir -p "$ROOT/BuildOutputs"
-(cd "$ROOT" && shasum -a 256 -c SHA256SUMS.txt)
 RUN="$(mktemp -d "$ROOT/BuildOutputs/phase${PHASE}.XXXXXX")"
+# Keep both manifests and the failure log even when preflight stops the build.
+cp "$ROOT/SHA256SUMS.txt" "$RUN/source-SHA256SUMS.original.txt"
+python3 -B "$ROOT/Tools/source_checksums.py" normalize \
+  "$ROOT/SHA256SUMS.txt" "$RUN/source-SHA256SUMS.txt"
+(cd "$ROOT" && shasum -a 256 -c "$RUN/source-SHA256SUMS.txt") 2>&1 | tee "$RUN/checksums.log"
+python3 -B "$ROOT/Tests/test_source_checksums.py" 2>&1 | tee "$RUN/checksum-tests.log"
 PROJECT="$ROOT/Phase$PHASE/JPLive.xcodeproj"
 RESOLVED="$PROJECT/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
 # Evidence identifies the exact source and toolchain; a later ZIP cannot inherit it.
-cp "$ROOT/SHA256SUMS.txt" "$RUN/source-SHA256SUMS.txt"
 xcodebuild -version > "$RUN/toolchain.txt"
 xcrun swift --version >> "$RUN/toolchain.txt"
 xcrun --sdk iphonesimulator --show-sdk-version >> "$RUN/toolchain.txt"
