@@ -12,7 +12,11 @@
     "revision": "c6c4b9dc98c62bfa90ed66c5fd4f5d54e88c7b4f",
     "swiftTools": "6.2",
     "phase": 2,
-    "coreMLTargetDependencies": ["DeepFilterNetMLX", "MLX", "HuggingFace"],
+    "coreMLTargetDependencies": [
+      "DeepFilterNetMLX",
+      "MLX",
+      "HuggingFace"
+    ],
     "packageDependencies": {
       "mlx-swift": ">=0.30.6 <1.0.0",
       "swift-huggingface": ">=0.6.0 <1.0.0",
@@ -33,7 +37,10 @@
     "remoteBinaryTargets": [],
     "buildToolPlugins": [],
     "diarization": "disabled only for the tested Playgrounds host limitation; retained in Phase 2",
-    "runtimeAssets": ["Apple Speech ja-JP/en-US", "Apple Translation source language to ko"],
+    "runtimeAssets": [
+      "Apple Speech ja-JP/en-US",
+      "Apple Translation source language to ko"
+    ],
     "lastUserReportedBuild": {
       "dependencyResolution": "passed after external packages removed",
       "compile": "failed with three LanguageTools diagnostics: CFLocaleIdentifier, StringTransform inference, Bundle.module",
@@ -42,9 +49,11 @@
     "newResolveCompileRun": "NOT RUN for the current LanguageTools/resource-loading fix"
   },
   "Phase2Resolution": {
-    "status": "NOT RUN; transitive versions are not yet resolved or locked",
+    "status": "RESOLVED and locked: 9 dependencies from actual Phase 2 CI run 7; exact bytes preserved",
     "preserve": "Phase2/JPLive.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
     "archiveCopy": "BuildOutputs/Package.resolved",
-    "policy": "Preserve the actual first successful Xcode resolution in the project; use -disableAutomaticPackageResolution for archive; do not invent a lockfile"
+    "policy": "Keep the actual resolved graph; disable automatic package resolution when the lockfile exists. User-authorized package-plugin validation skip is Phase 2 only. No macro-validation skip.",
+    "sourceRun": "https://github.com/Mngu39/JP_Live/actions/runs/34706198247",
+    "sha256": "2b362b5aac09270fcf129ea0fcd4ee75430e6caa21c01368fbb03a42c75a4aa7"
   }
 }
