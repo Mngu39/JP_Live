@@ -1,6 +1,6 @@
 # JP Live — Phase 1 / Phase 2 소스 프로토타입
 
-> **최신 상태: [현재상태.md](현재상태.md), checksum-preflight-2026-09-12 / CI 결과 2026-09-13.** 두 macOS CI에서 체크섬과 Python 회귀 테스트 8개가 통과했습니다. 이어 Phase 1은 Separation.swift의 try 누락으로 컴파일 실패, Phase 2는 패키지 resolve 성공 후 MLX CudaBuild 플러그인 승인 단계에서 실패했습니다. Swift XCTest 72개·기기용 build는 미진입이며, 이전 iPad STT timestamp 오류의 해결은 아직 실기로 확인되지 않았습니다. 아래 이전 검토의 수치/판정은 해당 시점의 기록입니다.
+> **최신 상태: [현재상태.md](현재상태.md), ci-compiler-followup-2026-09-14.** Phase 1은 컴파일을 통과해 XCTest 72개를 실제 실행했고 63개 통과·9개 실패(assertion 18건)입니다. Core 55개는 전부 통과했습니다. Phase 2의 플러그인 승인과 Metal 설치 수정 후 최신 결과는 현재상태 문서를 참조하세요. 최종 기기용 build·현재 소스 iPad 런타임 성공은 확인되지 않았습니다. 사용 가능 판정과 iPad 재실행 요청을 보류합니다. 아래 이전 검토의 수치/판정은 해당 시점의 기록입니다.
 
 2026-09-07 작성, 2026-09-08 LanguageTools의 실제 컴파일 오류 3건 수정, 2026-09-09 전달본 갱신. **iPad에서 실행 성공을 확인한 완성 앱이나 서명된 IPA가 아닙니다.**
 사용자 보고상 외부 패키지를 제거한 Phase 1은 의존성 단계를 통과했고, Apple 컴파일러에서 CFLocaleIdentifier·StringTransform 타입 추론·Bundle.module 오류가 발생했습니다. 이번에는 그 세 호출과 JSON 로드 확인만 수정했습니다. **이번 수정본의 Apple 컴파일·앱 실행·JSON 실제 로드는 아직 확인하지 못했습니다.** 이전 Nemo/unzip 실패에 대한 Phase 1 외부 SPM 0개 구성은 유지합니다.
@@ -52,7 +52,7 @@ Phase 1은 `preferredStrategy` 심볼을 사용하지 않는 기존 TranslationS
 ## Phase 2 빌드 / sideload
 
 1. iOS 27 SDK를 포함한 Xcode가 설치된 macOS 호스트가 필요합니다. Windows와 SideStore만으로 Swift 앱을 빌드하지는 못합니다.
-2. `Phase2/JPLive.xcodeproj`를 열고 `JPLive` scheme을 사용합니다. FluidAudio와 DeepFilterNetCoreML 커밋은 고정했습니다. 전이 의존성은 최초 Xcode resolve 뒤 생성되는 Package.resolved도 함께 보관해야 재현성이 완성됩니다.
+2. `Phase2/JPLive.xcodeproj`를 열고 `JPLive` scheme을 사용합니다. FluidAudio와 DeepFilterNetCoreML 커밋은 고정했습니다. 실제 실행 #7에서 resolve한 전이 의존성 9개의 Package.resolved를 저장소에 그대로 보존했습니다.
 3. 먼저 시뮬레이터에서 빌드·XCTest를 수행합니다. STT/번역/캡처의 판정은 실기로 합니다.
 4. `bash Tools/build-macos.sh`는 Release archive를 만들고 `BuildOutputs/JPLive-unsigned.ipa`로 묶습니다. **이 파일은 스크립트가 성공했을 때만 생성됩니다. 현재 제공물에는 IPA가 없습니다.**
 5. 생성한 IPA를 SideStore 등으로 서명·설치합니다. 현재 기기의 iPadOS 27 빌드와 SideStore 호환성, 계정/설치 조건을 먼저 확인합니다. 임의의 계정 생성, 유료 호스트 구매, 원격 작업 실행은 하지 않았습니다.
@@ -60,7 +60,7 @@ Phase 1은 `preferredStrategy` 심볼을 사용하지 않는 기존 TranslationS
 
 빌드만으로 해결되는 것은 SDK/프로젝트 구성입니다. YouTube 오디오 수신·백그라운드 유지·분리 모델 성능을 sideload만으로 해결했다고 간주하지 않습니다.
 
-Phase 2의 DeepFilterNetCoreML target에는 DeepFilterNetMLX·MLX·HuggingFace가 연결되며 패키지 그래프에는 swift-argument-parser도 있습니다. Core ML 단독 패키지라고 취급하지 않습니다. 최초 resolve 후 `Phase2/JPLive.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`를 프로젝트에 보존해야 합니다. 빌드 스크립트는 이 파일을 확인·복사하고 archive에 `-disableAutomaticPackageResolution`을 사용합니다. 실제 resolve 전인 지금 임의의 버전으로 lockfile을 만들지는 않았습니다. 근거와 빌드 검증 범위는 [추가검토결과.md](추가검토결과.md)에 정리했습니다.
+Phase 2의 DeepFilterNetCoreML target에는 DeepFilterNetMLX·MLX·HuggingFace가 연결되며 패키지 그래프에는 swift-argument-parser도 있습니다. Core ML 단독 패키지라고 취급하지 않습니다. `Phase2/JPLive.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`에는 실행 #7의 실제 resolve 결과를 보존했습니다. 빌드 스크립트는 이 파일을 확인·복사하고 archive에 `-disableAutomaticPackageResolution`을 사용합니다. lockfile의 패키지 버전을 임의로 바꾸지 않았습니다. Phase 2의 비대화형 build/test/archive에는 사용자 지시에 따라 `-skipPackagePluginValidation`을 적용했으며 macro 검증은 생략하지 않습니다. 근거와 빌드 검증 범위는 [추가검토결과.md](추가검토결과.md)에 정리했습니다.
 
 ## Sudachi 연결 상태
 
