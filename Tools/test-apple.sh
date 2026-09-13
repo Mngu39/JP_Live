@@ -30,8 +30,13 @@ xcrun simctl list devices available -j > "$RUN/simulators.json"
 DESTINATION_ID="$(python3 "$ROOT/Tools/select-simulator.py" "$RUN/simulators.json" "$MIN_SDK")"
 # macOS ships Bash 3.2: an empty array expanded under `set -u` is not portable.
 run_xcodebuild() {
-  if [[ "$PHASE" == 2 && -s "$RESOLVED" ]]; then
-    xcodebuild "$@" -disableAutomaticPackageResolution
+  if [[ "$PHASE" == 2 ]]; then
+    # Noninteractive package-plugin approval for the preserved Phase 2 graph.
+    if [[ -s "$RESOLVED" ]]; then
+      xcodebuild "$@" -skipPackagePluginValidation -disableAutomaticPackageResolution
+    else
+      xcodebuild "$@" -skipPackagePluginValidation
+    fi
   else
     xcodebuild "$@"
   fi
