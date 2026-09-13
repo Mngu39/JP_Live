@@ -15,6 +15,43 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: Install Metal Toolchain for Phase 2
+        if: inputs.phase == '2'
+        run: xcodebuild -downloadComponent MetalToolchain
+      - name: Compile and run native regression tests
+        run: bash Tools/test-apple.sh '${{ inputs.phase }}'
+      - name: Preserve diagnostics and test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-validation-phase-${{ inputs.phase }}
+          path: |
+            BuildOutputs/**/toolchain.txt
+            BuildOutputs/**/source-SHA256SUMS.txt
+            BuildOutputs/**/source-SHA256SUMS.original.txt
+            BuildOutputs/**/simulators.json
+            BuildOutputs/**/*.log
+            BuildOutputs/**/*.xcresult
+            BuildOutputs/**/Package.resolved
+            BuildOutputs/**/PASS.txt
+          if-no-files-found: warn
+name: Apple validation
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Validation target
+        type: choice
+        options: ['1', '2']
+        default: '1'
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ${{ inputs.phase == '2' && 'xcode-27' || 'macos-26' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
       - name: Compile and run native regression tests
         run: bash Tools/test-apple.sh '${{ inputs.phase }}'
       - name: Preserve diagnostics and test results
