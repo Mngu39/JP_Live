@@ -23,7 +23,7 @@ fi
 cp "$RESOLVED" "$BUILD_ROOT/Package.resolved"
 cp "$RESOLVED" "$ROOT/BuildOutputs/Package.resolved"
 xcodebuild -project "$ROOT/Phase2/JPLive.xcodeproj" -scheme JPLive \
-  -disableAutomaticPackageResolution \
+  -disableAutomaticPackageResolution -skipPackagePluginValidation \
   -configuration Release -destination 'generic/platform=iOS' \
   -archivePath "$BUILD_ROOT/JPLive.xcarchive" archive CODE_SIGNING_ALLOWED=NO
 if ! cmp -s "$RESOLVED" "$BUILD_ROOT/Package.resolved"; then
