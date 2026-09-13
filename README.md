@@ -1,6 +1,6 @@
 # JP Live — Phase 1 / Phase 2 소스 프로토타입
 
-> **최신 상태: [현재상태.md](현재상태.md), audio-timeline-2026-09-10.** 이전 사본은 사용자 iPad에서 컴파일·앱 실행·STT 준비에 성공했으나 스트리밍 timestamp 오류로 실패했습니다. 이번 수정본의 Apple 빌드·72개 XCTest 실행·iPad runtime은 미실행입니다. 아래 이전 검토의 수치/판정은 해당 시점의 기록입니다.
+> **최신 상태: [현재상태.md](현재상태.md), checksum-preflight-2026-09-12 / CI 결과 2026-09-13.** 두 macOS CI에서 체크섬과 Python 회귀 테스트 8개가 통과했습니다. 이어 Phase 1은 Separation.swift의 try 누락으로 컴파일 실패, Phase 2는 패키지 resolve 성공 후 MLX CudaBuild 플러그인 승인 단계에서 실패했습니다. Swift XCTest 72개·기기용 build는 미진입이며, 이전 iPad STT timestamp 오류의 해결은 아직 실기로 확인되지 않았습니다. 아래 이전 검토의 수치/판정은 해당 시점의 기록입니다.
 
 2026-09-07 작성, 2026-09-08 LanguageTools의 실제 컴파일 오류 3건 수정, 2026-09-09 전달본 갱신. **iPad에서 실행 성공을 확인한 완성 앱이나 서명된 IPA가 아닙니다.**
 사용자 보고상 외부 패키지를 제거한 Phase 1은 의존성 단계를 통과했고, Apple 컴파일러에서 CFLocaleIdentifier·StringTransform 타입 추론·Bundle.module 오류가 발생했습니다. 이번에는 그 세 호출과 JSON 로드 확인만 수정했습니다. **이번 수정본의 Apple 컴파일·앱 실행·JSON 실제 로드는 아직 확인하지 못했습니다.** 이전 Nemo/unzip 실패에 대한 Phase 1 외부 SPM 0개 구성은 유지합니다.
