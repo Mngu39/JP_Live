@@ -92,9 +92,20 @@ final class SeparatedSpeechExperiment {
             }
             async let a: Void = first.finish()
             async let b: Void = second.finish()
-            _ = await (a, b)
+            _ = try await (a, b)
             if !failures.isEmpty { throw AppFailure.message(failures.joined(separator: " · ")) }
-        } catch { await first.finish(); await second.finish(); throw error }
+        } catch {
+            let originalError = error
+            var cleanupFailures: [String] = []
+            for engine in engines {
+                do { try await engine.finish() }
+                catch { cleanupFailures.append(error.localizedDescription) }
+            }
+            if !cleanupFailures.isEmpty {
+                throw AppFailure.message(([originalError.localizedDescription] + cleanupFailures).joined(separator: " · "))
+            }
+            throw originalError
+        }
         return rows.sorted { $0.start < $1.start }
     }
 }
