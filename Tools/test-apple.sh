@@ -2,10 +2,12 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PHASE="${1:-1}"
+REQUESTED_PHASE="$PHASE"
 case "$PHASE" in
   1) MIN_SDK=26 ;;
+  1-trace) PHASE=1; MIN_SDK=26 ;;
   2) MIN_SDK=27 ;;
-  *) echo "Usage: bash Tools/test-apple.sh [1|2]" >&2; exit 2 ;;
+  *) echo "Usage: bash Tools/test-apple.sh [1|1-trace|2]" >&2; exit 2 ;;
 esac
 SDK_VERSION="$(xcrun --sdk iphonesimulator --show-sdk-version)"
 if [[ "${SDK_VERSION%%.*}" -lt "$MIN_SDK" ]]; then
@@ -37,6 +39,10 @@ run_xcodebuild() {
     else
       xcodebuild "$@" -skipPackagePluginValidation
     fi
+  elif [[ "$REQUESTED_PHASE" == 1-trace ]]; then
+    xcodebuild "$@" \
+      -only-testing:JPLiveTests/AudioConversionTests/testVeryShortEOFAndDoubleFlushDoNotDuplicateAudio \
+      -only-testing:JPLiveTests/AudioConversionTests/testSpeechInputTenMillisecondFramesUseConvertedSampleClock
   else
     xcodebuild "$@"
   fi
@@ -50,6 +56,10 @@ run_xcodebuild -project "$PROJECT" -scheme JPLive -configuration Debug \
   -destination "platform=iOS Simulator,id=$DESTINATION_ID" \
   -derivedDataPath "$RUN/DerivedData" -resultBundlePath "$RUN/tests.xcresult" \
   -parallel-testing-enabled NO test CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$RUN/tests.log"
+if [[ "$REQUESTED_PHASE" == 1-trace ]]; then
+  echo "DIAGNOSTIC ONLY: two existing tests; not full validation or a device-build pass."
+  exit 0
+fi
 run_xcodebuild -project "$PROJECT" -scheme JPLive -configuration Release \
   -destination 'generic/platform=iOS' \
   -derivedDataPath "$RUN/DeviceDerivedData" build CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$RUN/device-build.log"
