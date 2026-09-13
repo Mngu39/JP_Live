@@ -62,7 +62,7 @@ final class AudioConversionTests: XCTestCase {
     }
     func testVeryShortEOFAndDoubleFlushDoNotDuplicateAudio() throws {
         let input = makeBuffer(signal(count: 37, rate: 44100), rate: 44100)
-        let converter = try StreamingPCMConverter(from: input.format, to: format(48000), origin: 0)
+        let converter = try StreamingPCMConverter(from: input.format, to: format(48000), origin: 0, diagnosticLabel: "short-37-44100-to-48000")
         let first = try converter.convert(input)
         let tail = try converter.flush()
         XCTAssertEqual(Double((first + tail).reduce(0) { $0 + Int($1.buffer.frameLength) }), 37*48000.0/44100, accuracy: 1.1)
@@ -71,7 +71,7 @@ final class AudioConversionTests: XCTestCase {
     }
     func testSpeechInputTenMillisecondFramesUseConvertedSampleClock() throws {
         for rate in [16000.0, 24000, 44100, 48000] {
-            let converter = SpeechInputConverter(format: format(rate))
+            let converter = SpeechInputConverter(format: format(rate), diagnosticLabel: rate == 16000 ? "ten-ms-48000-to-16000" : nil)
             var inputs: [AnalyzerInput] = []
             for index in 0..<1000 {
                 inputs += try converter.convert(PCMChunk(buffer: makeBuffer(signal(count: 480, rate: 48000), rate: 48000),
