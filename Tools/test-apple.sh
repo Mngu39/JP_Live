@@ -47,64 +47,6 @@ run_xcodebuild() {
   fi
 }
 if [[ "$PHASE" == 2 ]]; then
-  # Diagnostic only: establish whether ScreenCaptureKit is exposed by the
-  # device SDK, simulator SDK, both, or neither before the app target compiles.
-  # Do not alter the app source or hide the import based on this probe.
-  {
-    echo "=== ScreenCaptureKit SDK probe ==="
-    echo "Xcode:"
-    xcodebuild -version
-    DEVICE_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-    SIM_SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
-    echo "DEVICE_SDK=$DEVICE_SDK"
-    echo "SIM_SDK=$SIM_SDK"
-    echo "--- Framework paths ---"
-    for sdk in "$DEVICE_SDK" "$SIM_SDK"; do
-      framework="$sdk/System/Library/Frameworks/ScreenCaptureKit.framework"
-      echo "SDK=$sdk"
-      if [[ -d "$framework" ]]; then
-        echo "framework=present"
-        find "$framework" -maxdepth 3 -type f \( -name 'module.modulemap' -o -name '*.swiftinterface' -o -name '*.swiftmodule' \) -print | sort
-      else
-        echo "framework=missing"
-      fi
-    done
-
-    PROBE_SWIFT="$RUN/ScreenCaptureKitProbe.swift"
-    printf 'import ScreenCaptureKit\n' > "$PROBE_SWIFT"
-
-    echo "--- device swiftc import probe ---"
-    set +e
-    xcrun --sdk iphoneos swiftc \
-      -target arm64-apple-ios27.0 \
-      -sdk "$DEVICE_SDK" \
-      -typecheck "$PROBE_SWIFT"
-    DEVICE_PROBE_STATUS=$?
-    set -e
-    echo "device_probe_status=$DEVICE_PROBE_STATUS"
-
-    echo "--- simulator swiftc import probe ---"
-    set +e
-    xcrun --sdk iphonesimulator swiftc \
-      -target arm64-apple-ios27.0-simulator \
-      -sdk "$SIM_SDK" \
-      -typecheck "$PROBE_SWIFT"
-    SIM_PROBE_STATUS=$?
-    set -e
-    echo "simulator_probe_status=$SIM_PROBE_STATUS"
-
-    echo "--- relevant app build settings: generic iOS ---"
-    run_xcodebuild -project "$PROJECT" -scheme JPLive -configuration Debug \
-      -destination 'generic/platform=iOS' -showBuildSettings 2>/dev/null \
-      | grep -E '^[[:space:]]*(SDKROOT|SUPPORTED_PLATFORMS|PLATFORM_NAME|EFFECTIVE_PLATFORM_NAME|ARCHS|VALID_ARCHS|SWIFT_ACTIVE_COMPILATION_CONDITIONS|IPHONEOS_DEPLOYMENT_TARGET)[[:space:]]*=' || true
-
-    echo "--- relevant app build settings: selected simulator ---"
-    run_xcodebuild -project "$PROJECT" -scheme JPLive -configuration Debug \
-      -destination "platform=iOS Simulator,id=$DESTINATION_ID" -showBuildSettings 2>/dev/null \
-      | grep -E '^[[:space:]]*(SDKROOT|SUPPORTED_PLATFORMS|PLATFORM_NAME|EFFECTIVE_PLATFORM_NAME|ARCHS|VALID_ARCHS|SWIFT_ACTIVE_COMPILATION_CONDITIONS|IPHONEOS_DEPLOYMENT_TARGET)[[:space:]]*=' || true
-    echo "=== End ScreenCaptureKit SDK probe ==="
-  } 2>&1 | tee "$RUN/screencapturekit-probe.log"
-
   run_xcodebuild -resolvePackageDependencies -project "$PROJECT" -scheme JPLive 2>&1 | tee "$RUN/resolve.log"
   test -s "$RESOLVED"
   cp "$RESOLVED" "$RUN/Package.resolved"

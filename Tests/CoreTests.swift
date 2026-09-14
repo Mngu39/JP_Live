@@ -3,6 +3,17 @@ import AVFoundation
 @testable import JPLive
 
 final class CoreTests: XCTestCase {
+    #if targetEnvironment(simulator)
+    @MainActor
+    func testSystemAudioInputFailsExplicitlyOnSimulator() async {
+        do {
+            _ = try await SystemAudioInput().start()
+            XCTFail("Simulator system audio capture must not silently succeed.")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("Simulator"))
+        }
+    }
+    #endif
     func testLearningResourcesDecodeInApplicationBundle() {
         XCTAssertFalse(LearningData.kanji.isEmpty, LearningData.resourceStatus.joined(separator: " · "))
         XCTAssertFalse(LearningData.deck.isEmpty, LearningData.resourceStatus.joined(separator: " · "))

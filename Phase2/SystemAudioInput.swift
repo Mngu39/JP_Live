@@ -1,9 +1,29 @@
 import Foundation
-@preconcurrency import ScreenCaptureKit
 @preconcurrency import AVFoundation
 import CoreMedia
 
-// Compiled only in the iOS 27 target. This file is never included in the Playground target.
+#if targetEnvironment(simulator)
+
+// ScreenCaptureKit is absent from the iOS 27 Simulator SDK. Keep the same
+// AudioInput surface so the rest of the app and simulator-hosted core tests
+// compile, but fail explicitly if system capture is actually requested.
+// The physical-device branch below still imports and compiles the real
+// ScreenCaptureKit implementation, so device validation cannot silently
+// fall back to this path.
+@MainActor
+final class SystemAudioInput: NSObject, AudioInput {
+    func start() async throws -> AsyncThrowingStream<PCMChunk, Error> {
+        throw AppFailure.message("iOS Simulator에서는 시스템 오디오 캡처를 사용할 수 없습니다.")
+    }
+
+    func stop() async {}
+}
+
+#else
+
+@preconcurrency import ScreenCaptureKit
+
+// Physical iOS 27+ implementation. This file is never included in the Playground target.
 @MainActor
 final class SystemAudioInput: NSObject, AudioInput {
     private var stream: SCStream?
@@ -114,3 +134,5 @@ private final class CaptureDelegate: NSObject, SCContentSharingPickerObserver, S
         }
     }
 }
+
+#endif
