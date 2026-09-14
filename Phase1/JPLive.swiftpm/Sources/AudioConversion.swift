@@ -42,6 +42,9 @@ final class StreamingPCMConverter {
     let origin: Double
     private let converter: AVAudioConverter?
     private var outputFrames: Int64 = 0
+    private var sourceInputFrames: Int64 = 0
+    private var leadingOutputFramesRemaining: Int64 = 0
+    private var outputRateRatio: Double = 1
     private var diagnosticInputFrames: Int64 = 0
     private let diagnosticLabel: String?
     private var closed = false
@@ -52,15 +55,18 @@ final class StreamingPCMConverter {
         guard input.sampleRate > 0, output.sampleRate > 0, origin.isFinite else {
             throw AppFailure.message("오디오 변환 형식 오류")
         }
+        outputRateRatio = output.sampleRate / input.sampleRate
         if input == output { converter = nil }
         else {
             guard let value = AVAudioConverter(from: input, to: output) else {
                 throw AppFailure.message("오디오 형식 변환기 생성 실패")
             }
-            // Match Apple's iOS 26 sample: no external priming frames. This
-            // sacrifices boundary filter quality; internal held samples still
-            // require draining. Output time comes from emitted samples, not input chunks.
+            // Match Apple's SpeechAnalyzer sample: .none keeps the converted stream
+            // on the source timebase at the cost of boundary filter quality. The SRC
+            // still has FIR latency, so compensate that latency in emitted PCM while
+            // draining enough EOF tail to preserve the final accepted source samples.
             value.primeMethod = .none
+            leadingOutputFramesRemaining = Int64(ceil(Double(value.primeInfo.leadingFrames) * outputRateRatio))
             converter = value
         }
         trace("init")
@@ -70,6 +76,9 @@ final class StreamingPCMConverter {
             throw AppFailure.message("종료되었거나 입력 형식이 바뀐 변환기를 사용할 수 없습니다.")
         }
         guard input.frameLength > 0 else { return [] }
+        let (nextInputFrames, overflow) = sourceInputFrames.addingReportingOverflow(Int64(input.frameLength))
+        guard !overflow else { throw AppFailure.message("오디오 입력 샘플 수 범위 초과") }
+        sourceInputFrames = nextInputFrames
         if diagnosticLabel != nil { diagnosticInputFrames += Int64(input.frameLength) }
         if converter == nil { return [stamp(input)] }
         return try drain(input)
@@ -117,7 +126,7 @@ final class StreamingPCMConverter {
             }
             if let supplyError { throw supplyError }
             if status == .error { throw conversionError ?? NSError(domain: "PCMConversion", code: 1) }
-            if output.frameLength > 0 { outputs.append(stamp(output)) }
+            if output.frameLength > 0, let aligned = try align(output) { outputs.append(stamp(aligned)) }
             switch status {
             case .haveData:
                 guard output.frameLength > 0 else { throw AppFailure.message("오디오 변환기가 진행하지 못했습니다.") }
@@ -134,6 +143,31 @@ final class StreamingPCMConverter {
             }
         }
     }
+    // AVAudioConverter with .none operates in latency mode. Drop the reported
+    // source-side leading latency after converting it to the output sample grid,
+    // then expose at most the logical duration of all accepted source frames.
+    // EOF is still drained so the final real source response can enter that window.
+    private func align(_ buffer: AVAudioPCMBuffer) throws -> AVAudioPCMBuffer? {
+        var start: AVAudioFrameCount = 0
+        var available = Int64(buffer.frameLength)
+
+        if leadingOutputFramesRemaining > 0 {
+            let drop = min(available, leadingOutputFramesRemaining)
+            start = AVAudioFrameCount(drop)
+            available -= drop
+            leadingOutputFramesRemaining -= drop
+        }
+        guard available > 0 else { return nil }
+
+        let logicalOutputFrames = Int64(ceil(Double(sourceInputFrames) * outputRateRatio))
+        let remaining = logicalOutputFrames - outputFrames
+        guard remaining > 0 else { return nil }
+
+        let keep = min(available, remaining)
+        guard keep > 0, keep <= Int64(UInt32.max) else { return nil }
+        return try Self.copy(buffer, from: start, count: AVAudioFrameCount(keep))
+    }
+
     private static func copy(_ input: AVAudioPCMBuffer, from start: AVAudioFrameCount,
                              count: AVAudioFrameCount) throws -> AVAudioPCMBuffer {
         guard let output = AVAudioPCMBuffer(pcmFormat: input.format, frameCapacity: count) else {
