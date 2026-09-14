@@ -108,7 +108,7 @@ final class AudioConversionTests: XCTestCase {
 
     func testSpeechInputTenMillisecondFramesUseConvertedSampleClock() throws {
         for rate in [16000.0, 24000, 44100, 48000] {
-            let converter = SpeechInputConverter(format: format(rate), diagnosticLabel: rate == 16000 ? "ten-ms-48000-to-16000" : nil)
+            let converter = SpeechInputConverter(format: analyzerFormat(rate), diagnosticLabel: rate == 16000 ? "ten-ms-48000-to-16000" : nil)
             var inputs: [AnalyzerInput] = []
             for index in 0..<1000 {
                 inputs += try converter.convert(PCMChunk(buffer: makeBuffer(signal(count: 480, rate: 48000), rate: 48000),
@@ -121,7 +121,7 @@ final class AudioConversionTests: XCTestCase {
         }
     }
     func testSpeechInputGapRemainsInAnalyzerTimeline() throws {
-        let converter = SpeechInputConverter(format: format(16000))
+        let converter = SpeechInputConverter(format: analyzerFormat(16000))
         let buffer = makeBuffer(signal(count: 4800, rate: 48000), rate: 48000)
         var inputs = try converter.convert(PCMChunk(buffer: buffer, time: 2))
         inputs += try converter.convert(PCMChunk(buffer: makeBuffer(signal(count: 4800, rate: 48000), rate: 48000), time: 5))
@@ -139,7 +139,7 @@ final class AudioConversionTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(gaps.first).1, 5, accuracy: 1.0/48000)
     }
     func testFractionalSourceOriginDoesNotCreateNanosecondOverlaps() throws {
-        let converter = SpeechInputConverter(format: format(44100))
+        let converter = SpeechInputConverter(format: analyzerFormat(44100))
         let origin = 9.123456789
         var inputs: [AnalyzerInput] = []
         for index in 0..<301 {
@@ -197,10 +197,10 @@ final class AudioConversionTests: XCTestCase {
     }
     func testSpeechInputRejectsBackwardTimeAndNewRunStartsAtZero() throws {
         let buffer = makeBuffer(signal(count: 480, rate: 48000), rate: 48000)
-        let previous = SpeechInputConverter(format: format(16000))
+        let previous = SpeechInputConverter(format: analyzerFormat(16000))
         _ = try previous.convert(PCMChunk(buffer: buffer, time: 12))
         XCTAssertThrowsError(try previous.convert(PCMChunk(buffer: buffer, time: 0)))
-        let next = SpeechInputConverter(format: format(16000))
+        let next = SpeechInputConverter(format: analyzerFormat(16000))
         let result = try next.convert(PCMChunk(buffer: buffer, time: 0)) + next.flush()
         _ = try assertAnalyzerContinuity(result, start: 0)
     }
@@ -218,7 +218,7 @@ final class AudioConversionTests: XCTestCase {
     }
     func testPreprocessorTracksConvertedPCMThroughBothConversionStages() async throws {
         let pipeline = AudioPreprocessor()
-        let speech = SpeechInputConverter(format: format(16000))
+        let speech = SpeechInputConverter(format: analyzerFormat(16000))
         var inputs: [AnalyzerInput] = []
         for index in 0..<101 {
             let count = index == 100 ? 37 : 441
@@ -251,6 +251,17 @@ final class AudioConversionTests: XCTestCase {
         XCTAssertTrue(all.contains { abs($0.time - 1) < 0.000000001 })
     }
 
+    private func analyzerFormat(_ rate: Double) -> AVAudioFormat {
+        #if PHASE2
+        // Xcode 27 beta 6 Speech/AnalyzerInputConverter rejects Float32 analyzer
+        // targets with a framework precondition requiring signed 16-bit PCM.
+        // Production does not invent this format: AppleSpeechEngine receives its
+        // analyzer format from SpeechAnalyzer.bestAvailableAudioFormat(...).
+        return AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: rate, channels: 1, interleaved: false)!
+        #else
+        return format(rate)
+        #endif
+    }
     private func format(_ rate: Double) -> AVAudioFormat {
         AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 1, interleaved: false)!
     }
