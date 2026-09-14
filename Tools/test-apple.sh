@@ -41,8 +41,7 @@ run_xcodebuild() {
     fi
   elif [[ "$REQUESTED_PHASE" == 1-trace ]]; then
     xcodebuild "$@" \
-      -only-testing:JPLiveTests/AudioConversionTests/testVeryShortEOFAndDoubleFlushDoNotDuplicateAudio \
-      -only-testing:JPLiveTests/AudioConversionTests/testSpeechInputTenMillisecondFramesUseConvertedSampleClock
+      -only-testing:JPLiveTests/AudioConversionTests/testDiagnosticEOFTailContainsLastSampleResponse
   else
     xcodebuild "$@"
   fi
@@ -57,7 +56,7 @@ run_xcodebuild -project "$PROJECT" -scheme JPLive -configuration Debug \
   -derivedDataPath "$RUN/DerivedData" -resultBundlePath "$RUN/tests.xcresult" \
   -parallel-testing-enabled NO test CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$RUN/tests.log"
 if [[ "$REQUESTED_PHASE" == 1-trace ]]; then
-  echo "DIAGNOSTIC ONLY: two existing tests; not full validation or a device-build pass."
+  echo "DIAGNOSTIC ONLY: EOF impulse-tail energy probe; not full validation or a device-build pass."
   exit 0
 fi
 run_xcodebuild -project "$PROJECT" -scheme JPLive -configuration Release \

@@ -69,6 +69,32 @@ final class AudioConversionTests: XCTestCase {
         XCTAssertTrue(try converter.flush().isEmpty)
         XCTAssertThrowsError(try converter.convert(input))
     }
+    func testDiagnosticEOFTailContainsLastSampleResponse() throws {
+        let cases: [(inputRate: Double, outputRate: Double, count: Int, label: String)] = [
+            (44100, 48000, 37, "impulse-last-44100-to-48000"),
+            (48000, 16000, 480, "impulse-last-48000-to-16000")
+        ]
+        for item in cases {
+            var values = [Float](repeating: 0, count: item.count)
+            values[item.count - 1] = 1
+            let input = makeBuffer(values, rate: item.inputRate)
+            let converter = try StreamingPCMConverter(from: input.format, to: format(item.outputRate), origin: 0,
+                                                      diagnosticLabel: item.label)
+            let head = samples(try converter.convert(input))
+            let tail = samples(try converter.flush())
+            let threshold: Float = 0.0000001
+            let headPeak = head.map { abs($0) }.max() ?? 0
+            let tailPeak = tail.map { abs($0) }.max() ?? 0
+            let headEnergy = head.reduce(0.0) { $0 + Double($1 * $1) }
+            let tailEnergy = tail.reduce(0.0) { $0 + Double($1 * $1) }
+            let nonzero = tail.indices.filter { abs(tail[$0]) > threshold }
+            let firstNonzero = nonzero.first.map(String.init) ?? "none"
+            let lastNonzero = nonzero.last.map(String.init) ?? "none"
+            let tailValues = tail.map { String(describing: $0) }.joined(separator: ",")
+            print("[PCM_ENERGY] case=\(item.label) headFrames=\(head.count) tailFrames=\(tail.count) headPeak=\(headPeak) tailPeak=\(tailPeak) headEnergy=\(headEnergy) tailEnergy=\(tailEnergy) tailNonzeroCount=\(nonzero.count) tailFirstNonzero=\(firstNonzero) tailLastNonzero=\(lastNonzero) tailValues=[\(tailValues)]")
+        }
+    }
+
     func testSpeechInputTenMillisecondFramesUseConvertedSampleClock() throws {
         for rate in [16000.0, 24000, 44100, 48000] {
             let converter = SpeechInputConverter(format: format(rate), diagnosticLabel: rate == 16000 ? "ten-ms-48000-to-16000" : nil)
