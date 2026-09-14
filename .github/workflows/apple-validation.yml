@@ -33,5 +33,7 @@ jobs:
             BuildOutputs/**/*.log
             BuildOutputs/**/*.xcresult
             BuildOutputs/**/Package.resolved
+            BuildOutputs/**/*.ipa
+            BuildOutputs/**/*.ipa.sha256
             BuildOutputs/**/PASS.txt
           if-no-files-found: warn
