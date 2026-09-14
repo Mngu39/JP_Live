@@ -3,6 +3,86 @@ import AVFoundation
 @testable import JPLive
 
 final class CoreTests: XCTestCase {
+    #if PHASE2
+    @MainActor
+    func testDeviceValidationMetricsPassContinuousCaptureThroughAnalyzerInput() {
+        let metrics = DeviceValidationMetricStore(startedAt: Date(timeIntervalSince1970: 0), startedUptime: 10)
+        metrics.markSTTPrepared()
+        metrics.markCaptureRequested(observedAt: 10)
+        let raw = DeviceValidationAudioFormat(sampleRate: 48000, channels: 2, sampleFormat: "float32", interleaved: false)
+        let processed = DeviceValidationAudioFormat(sampleRate: 48000, channels: 1, sampleFormat: "float32", interleaved: false)
+        let analyzer = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: false)!
+        let analyzerBuffer = AVAudioPCMBuffer(pcmFormat: analyzer, frameCapacity: 160000)!
+        analyzerBuffer.frameLength = 160000
+
+        metrics.recordRaw(time: 0, frames: 480000, format: raw, observedAt: 10.1)
+        metrics.recordProcessed(time: 0, frames: 480000, format: processed)
+        metrics.recordSpeechAppend(frames: 480000)
+        metrics.recordAnalyzerInput(buffer: analyzerBuffer, startTime: .zero)
+        metrics.recordPipelineMetrics(AudioMetrics(rmsDB: -18, peakDB: -3))
+        metrics.recordSpeechResult(final: true, observedAt: 10.5)
+
+        let report = metrics.finish(userStopped: true, endedAt: Date(timeIntervalSince1970: 10), endedUptime: 20)
+        XCTAssertEqual(report.verdict, .pass)
+        XCTAssertEqual(report.rawGapCount, 0)
+        XCTAssertEqual(report.rawOverlapCount, 0)
+        XCTAssertEqual(report.processedFrames, report.speechAppendFrames)
+        XCTAssertEqual(report.analyzerChunks, 1)
+        XCTAssertEqual(report.finalSpeechResults, 1)
+        XCTAssertTrue(report.checks.contains { $0.name == "speech_analyzer_duration_preserved" && $0.verdict == .pass })
+    }
+
+    @MainActor
+    func testDeviceValidationMetricsFailWrongRawFormatAndTimelineGap() {
+        let metrics = DeviceValidationMetricStore(startedAt: Date(timeIntervalSince1970: 0), startedUptime: 20)
+        metrics.markSTTPrepared()
+        metrics.markCaptureRequested(observedAt: 20)
+        let wrongRaw = DeviceValidationAudioFormat(sampleRate: 44100, channels: 1, sampleFormat: "float32", interleaved: false)
+        let processed = DeviceValidationAudioFormat(sampleRate: 48000, channels: 1, sampleFormat: "float32", interleaved: false)
+        let analyzer = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: false)!
+        let analyzerBuffer = AVAudioPCMBuffer(pcmFormat: analyzer, frameCapacity: 32000)!
+        analyzerBuffer.frameLength = 32000
+
+        metrics.recordRaw(time: 0, frames: 44100, format: wrongRaw, observedAt: 20.1)
+        metrics.recordRaw(time: 1.1, frames: 44100, format: wrongRaw, observedAt: 21.2)
+        metrics.recordProcessed(time: 0, frames: 48000, format: processed)
+        metrics.recordProcessed(time: 1.1, frames: 48000, format: processed)
+        metrics.recordSpeechAppend(frames: 96000)
+        metrics.recordAnalyzerInput(buffer: analyzerBuffer, startTime: .zero)
+        metrics.recordPipelineMetrics(AudioMetrics(rmsDB: -20, peakDB: -4))
+
+        let report = metrics.finish(userStopped: true, endedAt: Date(timeIntervalSince1970: 2.1), endedUptime: 22.1)
+        XCTAssertEqual(report.verdict, .fail)
+        XCTAssertEqual(report.rawGapCount, 1)
+        XCTAssertTrue(report.checks.contains { $0.name == "raw_format_48k_stereo" && $0.verdict == .fail })
+        XCTAssertTrue(report.checks.contains { $0.name == "raw_timeline_continuity" && $0.verdict == .fail })
+    }
+
+    @MainActor
+    func testDeviceValidationRestartRequiresFreshZeroBasedTimelines() {
+        func session(start: Double) -> DeviceValidationSessionReport {
+            let metrics = DeviceValidationMetricStore(startedAt: Date(timeIntervalSince1970: 0), startedUptime: 30)
+            metrics.markSTTPrepared(); metrics.markCaptureRequested(observedAt: 30)
+            let raw = DeviceValidationAudioFormat(sampleRate: 48000, channels: 2, sampleFormat: "float32", interleaved: false)
+            let processed = DeviceValidationAudioFormat(sampleRate: 48000, channels: 1, sampleFormat: "float32", interleaved: false)
+            let analyzer = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: false)!
+            let analyzerBuffer = AVAudioPCMBuffer(pcmFormat: analyzer, frameCapacity: 160000)!
+            analyzerBuffer.frameLength = 160000
+            metrics.recordRaw(time: start, frames: 480000, format: raw, observedAt: 30.1)
+            metrics.recordProcessed(time: start, frames: 480000, format: processed)
+            metrics.recordSpeechAppend(frames: 480000)
+            metrics.recordAnalyzerInput(buffer: analyzerBuffer, startTime: CMTime(seconds: start, preferredTimescale: 16000))
+            metrics.recordPipelineMetrics(AudioMetrics(rmsDB: -18, peakDB: -3))
+            metrics.recordSpeechResult(final: true, observedAt: 30.5)
+            return metrics.finish(userStopped: true, endedAt: Date(timeIntervalSince1970: 10), endedUptime: 40)
+        }
+
+        let clean = DeviceValidationReport.make(sessions: [session(start: 0), session(start: 0)])
+        XCTAssertEqual(clean.restartCheck.verdict, .pass)
+        let stale = DeviceValidationReport.make(sessions: [session(start: 0), session(start: 10)])
+        XCTAssertEqual(stale.restartCheck.verdict, .fail)
+    }
+    #endif
     #if targetEnvironment(simulator)
     @MainActor
     func testSystemAudioInputFailsExplicitlyOnSimulator() async {

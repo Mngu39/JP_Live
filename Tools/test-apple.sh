@@ -62,7 +62,18 @@ fi
 run_xcodebuild -project "$PROJECT" -scheme JPLive -configuration Release \
   -destination 'generic/platform=iOS' \
   -derivedDataPath "$RUN/DeviceDerivedData" build CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$RUN/device-build.log"
-if [[ "$PHASE" == 2 ]]; then cmp "$RESOLVED" "$RUN/Package.resolved"; fi
+if [[ "$PHASE" == 2 ]]; then
+  cmp "$RESOLVED" "$RUN/Package.resolved"
+  APP_PATH="$(find "$RUN/DeviceDerivedData/Build/Products/Release-iphoneos" -maxdepth 1 -type d -name 'JPLive.app' -print -quit)"
+  test -n "$APP_PATH" -a -d "$APP_PATH"
+  IPA_STAGE="$RUN/UnsignedIPA"
+  mkdir -p "$IPA_STAGE/Payload"
+  ditto "$APP_PATH" "$IPA_STAGE/Payload/JPLive.app"
+  (cd "$IPA_STAGE" && /usr/bin/zip -qry "$RUN/JPLive-unsigned.ipa" Payload)
+  /usr/bin/unzip -tq "$RUN/JPLive-unsigned.ipa" >/dev/null
+  shasum -a 256 "$RUN/JPLive-unsigned.ipa" > "$RUN/JPLive-unsigned.ipa.sha256"
+fi
 echo "PASS: Phase $PHASE Apple compile, simulator XCTest, unsigned device build" | tee "$RUN/PASS.txt"
+if [[ "$PHASE" == 2 ]]; then echo "Unsigned IPA packaged for later re-sign/install validation: $RUN/JPLive-unsigned.ipa" | tee -a "$RUN/PASS.txt"; fi
 echo "Evidence: $RUN"
-echo "This does not certify iPad Playground packaging or live STT/Translation/capture."
+echo "This does not certify SideStore re-sign/install or real-device live capture/STT behavior."

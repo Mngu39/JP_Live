@@ -7,6 +7,9 @@ struct SettingsView: View {
     @State private var token = ""
     @State private var message = ""
     @State private var busy = false
+    #if PHASE2
+    @State private var deviceValidation = false
+    #endif
     var body: some View {
         NavigationStack {
             Form {
@@ -39,12 +42,19 @@ struct SettingsView: View {
                     Text("음성 분리 모델은 별도 준비가 필요합니다. 미연결 상태에서는 혼합음 STT를 유지합니다.").font(.caption)
                     #if PHASE2
                     Text("Phase 2 · iOS 27 시스템 캡처")
+                    Button("기기 검증", systemImage: "stethoscope") { deviceValidation = true }
+                        .disabled(model.running)
                     #else
                     Text("Phase 1 · 파일 오디오 입력 · 시스템 캡처는 Phase 2")
                     #endif
                 }
             }.navigationTitle("설정").toolbar { Button("완료") { dismiss() } }
         }
+        #if PHASE2
+        .sheet(isPresented: $deviceValidation) {
+            DeviceValidationView(language: model.language)
+        }
+        #endif
     }
 }
 

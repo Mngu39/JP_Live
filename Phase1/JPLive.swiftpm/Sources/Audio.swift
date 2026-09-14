@@ -132,15 +132,18 @@ final class AppleSpeechEngine {
     private var format: AVAudioFormat?
     private var converter: SpeechInputConverter?
     private var failed: String?
+    private var inputObserver: ((AVAudioPCMBuffer, CMTime?) -> Void)?
     private var didStart = false
     func prepare(language: SourceLanguage, result: @escaping (String, Bool, Double, Double) -> Void,
-                 failure: @escaping (String) -> Void) async throws {
+                 failure: @escaping (String) -> Void,
+                 inputObserver: ((AVAudioPCMBuffer, CMTime?) -> Void)? = nil) async throws {
         guard SpeechTranscriber.isAvailable,
               let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: language.rawValue))
         else { throw AppFailure.message("이 기기에서 선택한 언어의 Apple STT를 지원하지 않습니다.") }
         let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [],
             reportingOptions: [.volatileResults], attributeOptions: [.audioTimeRange])
         failed = nil
+        self.inputObserver = inputObserver
         let installation = try await AssetInventory.assetInstallationRequest(supporting: [transcriber])
         if let installer = installation {
             try await installer.downloadAndInstall()
@@ -179,7 +182,7 @@ final class AppleSpeechEngine {
         switch builder.yield(input) {
         case .dropped: throw AppFailure.message("STT 처리 지연으로 입력을 중지했습니다.")
         case .terminated: throw AppFailure.message("STT 입력 스트림이 종료되었습니다.")
-        case .enqueued: break
+        case .enqueued: inputObserver?(input.buffer, input.bufferStartTime)
         @unknown default: throw AppFailure.message("알 수 없는 STT 입력 상태")
         }
     }
@@ -200,7 +203,7 @@ final class AppleSpeechEngine {
         }
         await resultTask?.value
         if let failed, finishingError == nil { finishingError = AppFailure.message("STT 오류: " + failed) }
-        resultTask = nil; analyzer = nil; format = nil; converter = nil; didStart = false; failed = nil
+        resultTask = nil; analyzer = nil; format = nil; converter = nil; inputObserver = nil; didStart = false; failed = nil
         if let finishingError { throw finishingError }
     }
 }
