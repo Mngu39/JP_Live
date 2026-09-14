@@ -27,6 +27,7 @@ final class SystemAudioInput: NSObject, AudioInput {
 @MainActor
 final class SystemAudioInput: NSObject, AudioInput {
     private var stream: SCStream?
+    private var screenOutput: ScreenDiscardOutput?
     private var continuation: AsyncThrowingStream<PCMChunk, Error>.Continuation?
     private var delegate: CaptureDelegate?
     private let picker = SCContentSharingPicker.shared
@@ -48,26 +49,37 @@ final class SystemAudioInput: NSObject, AudioInput {
     func selected(_ filter: SCContentFilter) async {
         guard active else { return }
         let requestID = UUID(); selectionID = requestID
-        let previous = stream; stream = nil
+        let previous = stream
+        let previousScreenOutput = screenOutput
+        stream = nil; screenOutput = nil
         if let previous { try? await previous.stopCapture() }
+        _ = previousScreenOutput
         guard active, selectionID == requestID else { return }
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.sampleRate = 48000; config.channelCount = 2
         config.excludesCurrentProcessAudio = true
-        // No video encoding or screen storage. Keep screen callbacks minimal for the capture lifecycle.
+        // Screen pixels are not a product input. Keep the required screen output
+        // surface tiny, omit cursor composition, and discard its callbacks on an
+        // independent queue so screen delivery cannot serialize ahead of audio.
         config.width = 16; config.height = 16
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        config.showsCursor = false
         guard let delegate else { return }
+        let screenOutput = ScreenDiscardOutput()
         let stream = SCStream(filter: filter, configuration: config, delegate: delegate)
         self.stream = stream
+        self.screenOutput = screenOutput
         delegate.activate(stream)
         do {
-            try stream.addStreamOutput(delegate, type: .screen, sampleHandlerQueue: delegate.queue)
+            try stream.addStreamOutput(screenOutput, type: .screen, sampleHandlerQueue: screenOutput.queue)
             try stream.addStreamOutput(delegate, type: .audio, sampleHandlerQueue: delegate.queue)
             try await stream.startCapture()
             if !active || selectionID != requestID { try? await stream.stopCapture() }
         } catch {
+            if self.stream === stream {
+                self.stream = nil
+                self.screenOutput = nil
+            }
             if active && selectionID == requestID { continuation?.finish(throwing: error) }
         }
     }
@@ -76,18 +88,30 @@ final class SystemAudioInput: NSObject, AudioInput {
     }
     func stop() async {
         active = false; selectionID = UUID()
-        let previous = stream; stream = nil
+        let previous = stream
+        let previousScreenOutput = screenOutput
+        stream = nil; screenOutput = nil
         continuation?.finish(); continuation = nil
         if let delegate { picker.remove(delegate) }
         picker.isActive = false; delegate = nil
         if let previous { try? await previous.stopCapture() }
+        _ = previousScreenOutput
+    }
+}
+
+private final class ScreenDiscardOutput: NSObject, SCStreamOutput, @unchecked Sendable {
+    let queue = DispatchQueue(label: "JP-Live.capture.screen")
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        // Deliberately empty. The screen output exists only to preserve the
+        // ScreenCaptureKit capture lifecycle; no pixel, timing, or app state is consumed.
     }
 }
 
 private final class CaptureDelegate: NSObject, SCContentSharingPickerObserver, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     weak var owner: SystemAudioInput?
     let continuation: AsyncThrowingStream<PCMChunk, Error>.Continuation
-    let queue = DispatchQueue(label: "JP-Live.capture")
+    let queue = DispatchQueue(label: "JP-Live.capture.audio")
     private var origin: Double?
     private var clock = AudioSourceClock()
     private var streamID: ObjectIdentifier?
