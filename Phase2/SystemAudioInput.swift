@@ -63,7 +63,6 @@ final class SystemAudioInput: NSObject, AudioInput {
         // surface tiny, omit cursor composition, and discard its callbacks on an
         // independent queue so screen delivery cannot serialize ahead of audio.
         config.width = 16; config.height = 16
-        config.showsCursor = false
         guard let delegate else { return }
         let screenOutput = ScreenDiscardOutput()
         let stream = SCStream(filter: filter, configuration: config, delegate: delegate)
