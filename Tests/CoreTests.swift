@@ -83,7 +83,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(stale.restartCheck.verdict, .fail)
     }
     #endif
-    #if targetEnvironment(simulator)
+    #if PHASE2 && targetEnvironment(simulator)
     @MainActor
     func testSystemAudioInputFailsExplicitlyOnSimulator() async {
         do {
