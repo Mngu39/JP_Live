@@ -537,7 +537,8 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(Self.samples(outputs).count, 9600)
         XCTAssertTrue(Self.samples(outputs).allSatisfy { abs($0-0.2) < 0.0001 })
         for (index, output) in outputs.enumerated() { XCTAssertEqual(output.time, Double(index)/100, accuracy: 0.00001) }
-        XCTAssertFalse((await pipeline.takeAnalysisUpdates()).isEmpty)
+        let analysis = await pipeline.takeAnalysisUpdates()
+        XCTAssertFalse(analysis.isEmpty)
     }
     func testAnalysisDelayHasNoTwoSecondGateAndDropsNoAudio() async throws {
         let pipeline = AudioPreprocessor()
@@ -563,7 +564,8 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(Self.samples(outputs).count, 720)
         XCTAssertEqual(outputs.first?.time, 3)
         XCTAssertEqual(counts.process, 0)
-        XCTAssertFalse((await pipeline.takeAnalysisUpdates()).isEmpty)
+        let analysis = await pipeline.takeAnalysisUpdates()
+        XCTAssertFalse(analysis.isEmpty)
     }
     func testMixedBypassImmediatelyDropsPreviousSpeechGainButKeepsLimiter() {
         var leveler = SpeechLeveler()
@@ -605,7 +607,7 @@ final class CoreTests: XCTestCase {
             await pipeline.setProviders(analysis: PatternAnalysis(voicedUntil: 0.1, laterSpeakers: 1, laterSlot: 2), enhancement: enhancer)
             let (a, _) = try await pipeline.process(Self.pcm(count: 4800, time: 0, amplitude: 0.01))
             let (b, _) = try await pipeline.process(Self.pcm(count: 4800, time: 0.1, amplitude: 0.2))
-            let outputs = a + b + (try await pipeline.finish())
+            _ = a + b + (try await pipeline.finish())
             XCTAssertEqual(Self.samples(a), [Float](repeating: 0.01, count: 4800))
             XCTAssertEqual(Self.samples(b), [Float](repeating: 0.2, count: 4800))
             let analysis = await pipeline.takeAnalysisUpdates()
@@ -741,7 +743,8 @@ final class CoreTests: XCTestCase {
         let after = await enhancer.counts()
         XCTAssertEqual(after.process, 0)
         XCTAssertEqual(Self.samples(outputs), [Float](repeating: 0.2, count: 9600))
-        XCTAssertFalse((await pipeline.takeAnalysisUpdates()).isEmpty)
+        let analysis = await pipeline.takeAnalysisUpdates()
+        XCTAssertFalse(analysis.isEmpty)
     }
     private static func confirmedSpeakerPair() -> SoftSpeakerMapper {
         var mapper = SoftSpeakerMapper()
