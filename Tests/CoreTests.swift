@@ -59,6 +59,75 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
+    func testDeviceValidationScreenshotProbePassesContinuousAudioAcrossReconfigurationWindow() {
+        let metrics = DeviceValidationMetricStore(startedAt: Date(timeIntervalSince1970: 0), startedUptime: 10, requireScreenshotProbe: true)
+        metrics.markSTTPrepared(); metrics.markCaptureRequested(observedAt: 10)
+        let raw = DeviceValidationAudioFormat(sampleRate: 48000, channels: 2, sampleFormat: "float32", interleaved: false)
+        let processed = DeviceValidationAudioFormat(sampleRate: 48000, channels: 1, sampleFormat: "float32", interleaved: false)
+        let analyzer = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: false)!
+        let firstAnalyzer = AVAudioPCMBuffer(pcmFormat: analyzer, frameCapacity: 80000)!
+        firstAnalyzer.frameLength = 80000
+        let secondAnalyzer = AVAudioPCMBuffer(pcmFormat: analyzer, frameCapacity: 96000)!
+        secondAnalyzer.frameLength = 96000
+
+        metrics.recordRaw(time: 0, frames: 240000, format: raw, observedAt: 10.1)
+        metrics.recordProcessed(time: 0, frames: 240000, format: processed)
+        metrics.recordSpeechAppend(frames: 240000)
+        metrics.recordAnalyzerInput(buffer: firstAnalyzer, startTime: .zero)
+        metrics.markScreenshotProbeStarted(observedAt: 15)
+        metrics.markScreenshotProbeFinished(metadata: ["mime":"image/webp", "width":1600, "height":900, "size_bytes":12345], observedAt: 15.8)
+
+        metrics.recordRaw(time: 5, frames: 288000, format: raw, observedAt: 16)
+        metrics.recordProcessed(time: 5, frames: 288000, format: processed)
+        metrics.recordSpeechAppend(frames: 288000)
+        metrics.recordAnalyzerInput(buffer: secondAnalyzer, startTime: CMTime(seconds: 5, preferredTimescale: 16000))
+        metrics.recordPipelineMetrics(AudioMetrics(rmsDB: -18, peakDB: -3))
+        metrics.recordSpeechResult(final: true, observedAt: 16.5)
+
+        let report = metrics.finish(userStopped: true, endedAt: Date(timeIntervalSince1970: 11), endedUptime: 21)
+        XCTAssertEqual(report.verdict, .pass)
+        XCTAssertEqual(report.screenshotContinuity.verdict, .pass)
+        XCTAssertTrue(report.screenshotContinuity.rawWindowCompleted)
+        XCTAssertTrue(report.screenshotContinuity.processedWindowCompleted)
+        XCTAssertTrue(report.screenshotContinuity.analyzerWindowCompleted)
+        XCTAssertEqual(report.screenshotContinuity.rawGapCount, 0)
+        XCTAssertEqual(report.screenshotContinuity.rawOverlapCount, 0)
+        XCTAssertTrue(report.checks.contains { $0.name == "screenshot_audio_continuity" && $0.verdict == .pass })
+    }
+
+    @MainActor
+    func testDeviceValidationScreenshotProbeFailsWhenGapAppearsAfterReconfigurationStarts() {
+        let metrics = DeviceValidationMetricStore(startedAt: Date(timeIntervalSince1970: 0), startedUptime: 10, requireScreenshotProbe: true)
+        metrics.markSTTPrepared(); metrics.markCaptureRequested(observedAt: 10)
+        let raw = DeviceValidationAudioFormat(sampleRate: 48000, channels: 2, sampleFormat: "float32", interleaved: false)
+        let processed = DeviceValidationAudioFormat(sampleRate: 48000, channels: 1, sampleFormat: "float32", interleaved: false)
+        let analyzer = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: false)!
+        let firstAnalyzer = AVAudioPCMBuffer(pcmFormat: analyzer, frameCapacity: 80000)!
+        firstAnalyzer.frameLength = 80000
+        let secondAnalyzer = AVAudioPCMBuffer(pcmFormat: analyzer, frameCapacity: 96000)!
+        secondAnalyzer.frameLength = 96000
+
+        metrics.recordRaw(time: 0, frames: 240000, format: raw, observedAt: 10.1)
+        metrics.recordProcessed(time: 0, frames: 240000, format: processed)
+        metrics.recordSpeechAppend(frames: 240000)
+        metrics.recordAnalyzerInput(buffer: firstAnalyzer, startTime: .zero)
+        metrics.markScreenshotProbeStarted(observedAt: 15)
+        metrics.markScreenshotProbeFinished(metadata: ["mime":"image/webp", "width":1600, "height":900, "size_bytes":12345], observedAt: 15.8)
+
+        metrics.recordRaw(time: 5.1, frames: 288000, format: raw, observedAt: 16)
+        metrics.recordProcessed(time: 5.1, frames: 288000, format: processed)
+        metrics.recordSpeechAppend(frames: 288000)
+        metrics.recordAnalyzerInput(buffer: secondAnalyzer, startTime: CMTime(seconds: 5.1, preferredTimescale: 16000))
+        metrics.recordPipelineMetrics(AudioMetrics(rmsDB: -18, peakDB: -3))
+        metrics.recordSpeechResult(final: true, observedAt: 16.5)
+
+        let report = metrics.finish(userStopped: true, endedAt: Date(timeIntervalSince1970: 11.1), endedUptime: 21.1)
+        XCTAssertEqual(report.screenshotContinuity.verdict, .fail)
+        XCTAssertGreaterThan(report.screenshotContinuity.rawGapCount, 0)
+        XCTAssertTrue(report.checks.contains { $0.name == "screenshot_audio_continuity" && $0.verdict == .fail })
+    }
+
+    @MainActor
     func testDeviceValidationRestartRequiresFreshZeroBasedTimelines() {
         func session(start: Double) -> DeviceValidationSessionReport {
             let metrics = DeviceValidationMetricStore(startedAt: Date(timeIntervalSince1970: 0), startedUptime: 30)

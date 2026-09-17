@@ -12,8 +12,9 @@ struct DeviceValidationView: View {
                 Section("사용 방법") {
                     Text("1. 검증 시작 → 화면 전체 공유를 선택")
                     Text("2. 유튜브 등에서 실제 음성/대사를 20~30초 재생")
-                    Text("3. 이 앱으로 돌아와 검증 정지")
-                    Text("4. 같은 과정을 한 번 더 실행하면 stop → restart와 시간축 초기화까지 검증")
+                    Text("3. 실제 PCM 약 5초 후 저장과 같은 고해상도 스크린샷 재구성을 자동 실행합니다")
+                    Text("4. 스크린샷 뒤 최소 5초 이상 계속 재생한 다음 이 앱으로 돌아와 검증 정지")
+                    Text("5. 같은 과정을 한 번 더 실행하면 stop → restart와 시간축 초기화까지 검증")
                     Text("전사 문장은 저장하지 않고 PCM/STT 수치와 PASS/FAIL만 JSON에 기록합니다.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -33,6 +34,7 @@ struct DeviceValidationView: View {
                         LabeledContent("전처리 PCM", value: "\(latest.processedChunks) chunks · \(String(format: "%.2f", latest.processedAudioDuration)) s")
                         LabeledContent("Analyzer 입력", value: "\(latest.analyzerChunks) chunks · \(String(format: "%.2f", latest.analyzerAudioDuration)) s")
                         LabeledContent("STT 결과", value: "\(latest.speechResults) · final \(latest.finalSpeechResults)")
+                        LabeledContent("스크린샷 연속성", value: verdictTitle(latest.screenshotContinuity.verdict))
                         ForEach(latest.checks) { check in
                             VStack(alignment: .leading, spacing: 3) {
                                 HStack {
