@@ -595,7 +595,7 @@ final class DeviceValidationMetricStore {
             let verdict: DeviceValidationVerdict = screenshot.attempted ? screenshot.verdict : .warning
             let detail: String
             if !screenshot.attempted {
-                detail = "스크린샷 재구성 검증이 실행되지 않았습니다. 실제 PCM이 5초 이상 흐른 뒤 자동 실행되도록 세션을 충분히 유지하세요."
+                detail = "스크린샷 캡처 검증이 실행되지 않았습니다. 실제 PCM이 5초 이상 흐른 뒤 자동 실행되도록 세션을 충분히 유지하세요."
             } else if !screenshot.succeeded {
                 detail = "스크린샷 실패 · \(screenshot.error ?? "원인 미기록")"
             } else {

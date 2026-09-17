@@ -43,46 +43,62 @@ final class SystemAudioInput: NSObject, AudioInput {
     }
 
     func captureLearningScreenshot() async throws -> [String: Any] {
-        guard active, let stream, let screenOutput, let contentFilter else {
+        guard active, let contentFilter else {
             throw AppFailure.message("시스템 화면 캡처가 실행 중일 때만 스크린샷을 저장할 수 있습니다.")
         }
+        guard screenshotStream == nil else {
+            throw AppFailure.message("이미 저장용 스크린샷을 캡처하고 있습니다.")
+        }
+
+        // Reuse the filter that the person already approved in the system picker,
+        // but capture the still frame with a second, short-lived screen-only stream.
+        // The long-running 48 kHz audio stream and its 16×16 screen output are never
+        // reconfigured or stopped for the screenshot path.
         let requestID = selectionID
         let target = try Self.screenshotTarget(for: contentFilter, maxEdge: 1600)
-        let ticket = screenOutput.armScreenshot(minWidth: target.width, minHeight: target.height)
-        let highResolution = Self.captureConfiguration(width: target.width, height: target.height)
-        let lowResolution = Self.captureConfiguration(width: 16, height: 16)
+        let config = Self.screenshotConfiguration(width: target.width, height: target.height)
+        let output = ScreenFrameOutput()
+        let ticket = output.armScreenshot(minWidth: target.width, minHeight: target.height)
+        let stream = SCStream(filter: contentFilter, configuration: config, delegate: nil)
+        screenshotStream = stream
+        screenshotOutput = output
 
         do {
-            // iOS doesn't expose SCScreenshotManager. Reconfigure only the screen
-            // dimensions of the already-authorized running stream, wait for one
-            // matching .screen frame, then restore the 16×16 discard surface.
-            // Audio capture remains enabled at the same 48 kHz stereo settings.
-            try await stream.updateConfiguration(highResolution)
+            try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: output.queue)
+            try await stream.startCapture()
             let image = try await ticket.value()
-            guard active, self.stream === stream, selectionID == requestID else {
+            guard active, selectionID == requestID, self.screenshotStream === stream else {
                 throw AppFailure.message("화면 공유 대상이 바뀌어 스크린샷을 취소했습니다.")
             }
-            try await stream.updateConfiguration(lowResolution)
+            try? await stream.stopCapture()
+            if self.screenshotStream === stream {
+                screenshotStream = nil
+                screenshotOutput = nil
+            }
             return try Self.encodeScreenshot(image, target: target)
         } catch {
-            screenOutput.cancelScreenshot(ticket, error: error)
-            if active, self.stream === stream, selectionID == requestID {
-                try? await stream.updateConfiguration(lowResolution)
+            output.cancelScreenshot(ticket, error: error)
+            try? await stream.stopCapture()
+            if self.screenshotStream === stream {
+                screenshotStream = nil
+                screenshotOutput = nil
             }
             throw error
         }
     }
 
     private static func screenshotTarget(for filter: SCContentFilter, maxEdge: Int) throws -> ScreenshotTarget {
-        let scale = filter.pointPixelScale
+        let scale = Double(filter.pointPixelScale)
         let rect = filter.contentRect
+        let width = Double(rect.width)
+        let height = Double(rect.height)
         guard scale.isFinite, scale > 0,
-              rect.width.isFinite, rect.height.isFinite,
-              rect.width > 0, rect.height > 0 else {
+              width.isFinite, height.isFinite,
+              width > 0, height > 0 else {
             throw AppFailure.message("스크린샷 원본 화면 크기를 확인할 수 없습니다.")
         }
-        let sourceWidth = max(1, Int((rect.width * scale).rounded()))
-        let sourceHeight = max(1, Int((rect.height * scale).rounded()))
+        let sourceWidth = max(1, Int((width * scale).rounded()))
+        let sourceHeight = max(1, Int((height * scale).rounded()))
         let sourceEdge = max(sourceWidth, sourceHeight)
         let ratio = min(1, Double(maxEdge) / Double(sourceEdge))
         return ScreenshotTarget(
@@ -92,12 +108,20 @@ final class SystemAudioInput: NSObject, AudioInput {
             sourceHeight: sourceHeight)
     }
 
-    private static func captureConfiguration(width: Int, height: Int) -> SCStreamConfiguration {
+    private static func audioCaptureConfiguration() -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.sampleRate = 48000
         config.channelCount = 2
         config.excludesCurrentProcessAudio = true
+        config.width = 16
+        config.height = 16
+        return config
+    }
+
+    private static func screenshotConfiguration(width: Int, height: Int) -> SCStreamConfiguration {
+        let config = SCStreamConfiguration()
+        config.capturesAudio = false
         config.width = width
         config.height = height
         return config
@@ -143,6 +167,8 @@ final class SystemAudioInput: NSObject, AudioInput {
     private var stream: SCStream?
     private var screenOutput: ScreenFrameOutput?
     private var contentFilter: SCContentFilter?
+    private var screenshotStream: SCStream?
+    private var screenshotOutput: ScreenFrameOutput?
     private var continuation: AsyncThrowingStream<PCMChunk, Error>.Continuation?
     private var delegate: CaptureDelegate?
     private let picker = SCContentSharingPicker.shared
@@ -163,6 +189,9 @@ final class SystemAudioInput: NSObject, AudioInput {
         config.showsMicrophoneControl = false
         config.showsCameraControl = false
         picker.defaultConfiguration = config
+        // The picker defaults to one stream. Reserve a second slot so the same
+        // already-approved filter can be used by the short-lived screenshot stream.
+        picker.maximumStreamCount = 2
         picker.add(delegate); picker.isActive = true; picker.present()
         return sequence
     }
@@ -170,13 +199,21 @@ final class SystemAudioInput: NSObject, AudioInput {
     func selected(_ filter: SCContentFilter) async {
         guard active else { return }
         let requestID = UUID(); selectionID = requestID
+
+        let previousScreenshot = screenshotStream
+        let previousScreenshotOutput = screenshotOutput
+        screenshotStream = nil; screenshotOutput = nil
+        previousScreenshotOutput?.cancelPending(AppFailure.message("화면 공유 대상이 변경되었습니다."))
+        if let previousScreenshot { try? await previousScreenshot.stopCapture() }
+
         let previous = stream
         let previousScreenOutput = screenOutput
         stream = nil; screenOutput = nil; contentFilter = nil
         previousScreenOutput?.cancelPending(AppFailure.message("화면 공유 대상이 변경되었습니다."))
         if let previous { try? await previous.stopCapture() }
         guard active, selectionID == requestID else { return }
-        let config = Self.captureConfiguration(width: 16, height: 16)
+
+        let config = Self.audioCaptureConfiguration()
         guard let delegate else { return }
         let screenOutput = ScreenFrameOutput()
         let stream = SCStream(filter: filter, configuration: config, delegate: delegate)
@@ -210,13 +247,22 @@ final class SystemAudioInput: NSObject, AudioInput {
 
     func stop() async {
         active = false; selectionID = UUID()
+
+        let previousScreenshot = screenshotStream
+        let previousScreenshotOutput = screenshotOutput
+        screenshotStream = nil; screenshotOutput = nil
+        previousScreenshotOutput?.cancelPending(CancellationError())
+        if let previousScreenshot { try? await previousScreenshot.stopCapture() }
+
         let previous = stream
         let previousScreenOutput = screenOutput
         stream = nil; screenOutput = nil; contentFilter = nil
         previousScreenOutput?.cancelPending(CancellationError())
         continuation?.finish(); continuation = nil
         if let delegate { picker.remove(delegate) }
-        picker.isActive = false; delegate = nil
+        picker.isActive = false
+        picker.maximumStreamCount = 1
+        delegate = nil
         if let previous { try? await previous.stopCapture() }
     }
 }
@@ -271,7 +317,7 @@ private final class ScreenFrameOutput: NSObject, SCStreamOutput, @unchecked Send
         queue.sync {
             pending?.resolve(.failure(AppFailure.message("새 스크린샷 요청으로 이전 요청을 취소했습니다.")))
             pending = ticket
-            queue.asyncAfter(deadline: .now() + 3) { [weak self, weak ticket] in
+            queue.asyncAfter(deadline: .now() + 5) { [weak self, weak ticket] in
                 guard let self, let ticket, self.pending === ticket else { return }
                 self.pending = nil
                 ticket.resolve(.failure(AppFailure.message("고해상도 화면 프레임을 받지 못했습니다.")))
