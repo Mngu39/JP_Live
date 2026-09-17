@@ -19,6 +19,11 @@ final class SystemAudioInput: NSObject, AudioInput {
     func captureLearningScreenshot() async throws -> [String: Any] {
         throw AppFailure.message("iOS Simulator에서는 화면 캡처를 사용할 수 없습니다.")
     }
+
+    func deviceValidationProbeSecondScreenStreamStart() async throws {
+        throw AppFailure.message("iOS Simulator에서는 두 번째 화면 스트림을 검증할 수 없습니다.")
+    }
+
     func start() async throws -> AsyncThrowingStream<PCMChunk, Error> {
         throw AppFailure.message("iOS Simulator에서는 시스템 오디오 캡처를 사용할 수 없습니다.")
     }
@@ -78,6 +83,51 @@ final class SystemAudioInput: NSObject, AudioInput {
             return try Self.encodeScreenshot(image, target: target)
         } catch {
             output.cancelScreenshot(ticket, error: error)
+            try? await stream.stopCapture()
+            if self.screenshotStream === stream {
+                screenshotStream = nil
+                screenshotOutput = nil
+            }
+            throw error
+        }
+    }
+
+    // Device-validation-only probe. It deliberately uses the same approved filter and
+    // the smallest 16×16 screen-only configuration so one hardware run can separate
+    // "a concurrent second SCStream cannot start" from "only the high-resolution
+    // screenshot configuration fails". Product saves still use captureLearningScreenshot().
+    func deviceValidationProbeSecondScreenStreamStart() async throws {
+        guard active, let contentFilter else {
+            throw AppFailure.message("시스템 화면 캡처가 실행 중일 때만 두 번째 스트림을 검증할 수 있습니다.")
+        }
+        guard screenshotStream == nil else {
+            throw AppFailure.message("이미 저장용 스크린샷 스트림이 실행 중입니다.")
+        }
+
+        let requestID = selectionID
+        let output = ScreenFrameOutput()
+        let stream = SCStream(
+            filter: contentFilter,
+            configuration: Self.screenshotConfiguration(width: 16, height: 16),
+            delegate: nil)
+        screenshotStream = stream
+        screenshotOutput = output
+
+        do {
+            try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: output.queue)
+            try await stream.startCapture()
+            guard active, selectionID == requestID, self.screenshotStream === stream else {
+                throw AppFailure.message("화면 공유 대상이 바뀌어 두 번째 스트림 검증을 취소했습니다.")
+            }
+            // This probe is about whether the concurrent stream can enter the started
+            // state. No screenshot frame is required. Stop it immediately and leave the
+            // long-running audio stream untouched.
+            try? await stream.stopCapture()
+            if self.screenshotStream === stream {
+                screenshotStream = nil
+                screenshotOutput = nil
+            }
+        } catch {
             try? await stream.stopCapture()
             if self.screenshotStream === stream {
                 screenshotStream = nil

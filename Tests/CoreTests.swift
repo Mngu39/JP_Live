@@ -75,6 +75,9 @@ final class CoreTests: XCTestCase {
         metrics.recordSpeechAppend(frames: 240000)
         metrics.recordAnalyzerInput(buffer: firstAnalyzer, startTime: .zero)
         metrics.markScreenshotProbeStarted(observedAt: 15)
+        metrics.markLowResolutionSecondStreamProbeStarted(observedAt: 15.1)
+        metrics.markLowResolutionSecondStreamProbeFinished(observedAt: 15.2)
+        metrics.markHighResolutionScreenshotAttemptStarted()
         metrics.markScreenshotProbeFinished(metadata: ["mime":"image/webp", "width":1600, "height":900, "size_bytes":12345], observedAt: 15.8)
 
         metrics.recordRaw(time: 5, frames: 288000, format: raw, observedAt: 16)
@@ -92,6 +95,9 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(report.screenshotContinuity.analyzerWindowCompleted)
         XCTAssertEqual(report.screenshotContinuity.rawGapCount, 0)
         XCTAssertEqual(report.screenshotContinuity.rawOverlapCount, 0)
+        XCTAssertTrue(report.screenshotContinuity.lowResolutionSecondStream.attempted)
+        XCTAssertTrue(report.screenshotContinuity.lowResolutionSecondStream.started)
+        XCTAssertTrue(report.screenshotContinuity.highResolutionCaptureAttempted)
         XCTAssertTrue(report.checks.contains { $0.name == "screenshot_audio_continuity" && $0.verdict == .pass })
     }
 
@@ -112,6 +118,9 @@ final class CoreTests: XCTestCase {
         metrics.recordSpeechAppend(frames: 240000)
         metrics.recordAnalyzerInput(buffer: firstAnalyzer, startTime: .zero)
         metrics.markScreenshotProbeStarted(observedAt: 15)
+        metrics.markLowResolutionSecondStreamProbeStarted(observedAt: 15.1)
+        metrics.markLowResolutionSecondStreamProbeFinished(observedAt: 15.2)
+        metrics.markHighResolutionScreenshotAttemptStarted()
         metrics.markScreenshotProbeFinished(metadata: ["mime":"image/webp", "width":1600, "height":900, "size_bytes":12345], observedAt: 15.8)
 
         metrics.recordRaw(time: 5.1, frames: 288000, format: raw, observedAt: 16)
@@ -125,6 +134,37 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(report.screenshotContinuity.verdict, .fail)
         XCTAssertGreaterThan(report.screenshotContinuity.rawGapCount, 0)
         XCTAssertTrue(report.checks.contains { $0.name == "screenshot_audio_continuity" && $0.verdict == .fail })
+    }
+
+    @MainActor
+    func testDeviceValidationSecondStreamStartFailurePreservesNSErrorDetail() {
+        let metrics = DeviceValidationMetricStore(
+            startedAt: Date(timeIntervalSince1970: 0),
+            startedUptime: 10,
+            requireScreenshotProbe: true)
+        metrics.markScreenshotProbeStarted(observedAt: 15)
+        metrics.markLowResolutionSecondStreamProbeStarted(observedAt: 15.01)
+        let error = NSError(
+            domain: "SCStreamErrorDomain",
+            code: -3802,
+            userInfo: [NSLocalizedDescriptionKey: "Stream failed to start", "probe": "low-res-16x16"])
+        metrics.markLowResolutionSecondStreamProbeFailed(error, observedAt: 15.04)
+        metrics.markScreenshotProbeFailed(error, highResolutionAttempted: false, observedAt: 15.04)
+
+        let report = metrics.finish(
+            userStopped: true,
+            endedAt: Date(timeIntervalSince1970: 6),
+            endedUptime: 16)
+        let screenshot = report.screenshotContinuity
+        XCTAssertEqual(screenshot.verdict, .fail)
+        XCTAssertTrue(screenshot.lowResolutionSecondStream.attempted)
+        XCTAssertFalse(screenshot.lowResolutionSecondStream.started)
+        XCTAssertFalse(screenshot.highResolutionCaptureAttempted)
+        XCTAssertEqual(screenshot.lowResolutionSecondStream.error?.domain, "SCStreamErrorDomain")
+        XCTAssertEqual(screenshot.lowResolutionSecondStream.error?.code, -3802)
+        XCTAssertEqual(screenshot.lowResolutionSecondStream.error?.userInfo["probe"], "low-res-16x16")
+        XCTAssertEqual(screenshot.errorDetail?.domain, "SCStreamErrorDomain")
+        XCTAssertEqual(screenshot.errorDetail?.code, -3802)
     }
 
     @MainActor
