@@ -189,9 +189,6 @@ final class SystemAudioInput: NSObject, AudioInput {
         config.showsMicrophoneControl = false
         config.showsCameraControl = false
         picker.defaultConfiguration = config
-        // The picker defaults to one stream. Reserve a second slot so the same
-        // already-approved filter can be used by the short-lived screenshot stream.
-        picker.maximumStreamCount = 2
         picker.add(delegate); picker.isActive = true; picker.present()
         return sequence
     }
@@ -261,7 +258,6 @@ final class SystemAudioInput: NSObject, AudioInput {
         continuation?.finish(); continuation = nil
         if let delegate { picker.remove(delegate) }
         picker.isActive = false
-        picker.maximumStreamCount = 1
         delegate = nil
         if let previous { try? await previous.stopCapture() }
     }
