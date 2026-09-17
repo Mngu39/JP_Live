@@ -59,7 +59,8 @@ final class AppModel: ObservableObject {
 
     func learningScreenshot() async -> [String: Any]? {
         #if PHASE2
-        return try? await SystemAudioInput.captureLearningScreenshot()
+        guard let systemInput = input as? SystemAudioInput else { return nil }
+        return try? await systemInput.captureLearningScreenshot()
         #else
         return nil
         #endif
