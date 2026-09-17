@@ -51,18 +51,42 @@ enum AppFailure: LocalizedError {
     var errorDescription: String? { if case .message(let text) = self { return text }; return nil }
 }
 
-// Punctuation and connecting endings are only boundary hints, never a grammar parser.
+// Punctuation and connecting endings are boundary hints, never a grammar parser.
+// Live broadcast speech is dense, so a short breath must not close a chunk while a
+// strong punctuation hint should still settle quickly.
 struct ChunkBoundary {
+    static let hardDuration: Double = 8
+    static let strongPause: Double = 0.30
+    static let ordinaryPause: Double = 0.78
+    static let continuationPause: Double = 1.05
+
+    static func hasSemanticContent(_ text: String) -> Bool {
+        text.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) }
+    }
+    static func isPunctuationOnly(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !t.isEmpty && !hasSemanticContent(t)
+    }
+    static func hasStrongEnding(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let last = t.last else { return false }
+        return "。！？.!?".contains(last)
+    }
+    static func isJapaneseContinuation(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [
+            "けど", "けども", "けれど", "けれども", "から", "って", "ので",
+            "のに", "なら", "たり", "とか", "というか", "それで", "て", "し", "が"
+        ].contains(where: t.hasSuffix)
+    }
     static func shouldCommit(_ text: String, pause: Double, duration: Double,
                              language: SourceLanguage) -> Bool {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty else { return false }
-        if "。！？.!?".contains(t.last!) { return true }
-        if duration >= 9 || t.utf16.count >= (language == .japanese ? 110 : 240) { return true }
-        if language == .japanese && ["けど", "から", "って", "ので", "て", "し"].contains(where: t.hasSuffix) {
-            return pause >= 1.2
-        }
-        return pause >= 0.65
+        guard hasSemanticContent(t) else { return false }
+        if duration >= hardDuration || t.utf16.count >= (language == .japanese ? 110 : 240) { return true }
+        if language == .japanese && isJapaneseContinuation(t) { return pause >= continuationPause }
+        if hasStrongEnding(t) { return pause >= strongPause }
+        return pause >= ordinaryPause
     }
     static func split(_ text: String, limit: Int) -> [String] {
         guard text.count > limit else { return text.isEmpty ? [] : [text] }
@@ -74,11 +98,17 @@ struct ChunkBoundary {
     }
 }
 
+
+enum JapaneseText {
+    static func hiragana(_ value: String) -> String {
+        value.applyingTransform(.hiraganaToKatakana, reverse: true) ?? value
+    }
+}
+
 enum SavePayload {
     static func make(caption: Caption, session: LearningSession, token: WordToken?,
-                     tokens: [WordToken], translation: String) throws -> [String: Any] {
+                     tokens: [WordToken], translation: String, screenshot: [String: Any]? = nil) throws -> [String: Any] {
         guard caption.language == .japanese else { throw AppFailure.message("단어장 저장은 일본어만 지원합니다.") }
-        guard caption.isFinal else { throw AppFailure.message("인식 중인 자막은 확정된 후 저장할 수 있습니다.") }
         let json = String(decoding: try JSONEncoder().encode(tokens), as: UTF8.self)
         var body: [String: Any] = [
             "session_id": session.id, "source_text": caption.source,
@@ -87,6 +117,7 @@ enum SavePayload {
             "source_furigana_json": json,
             "created_tz_offset_min": -TimeZone.current.secondsFromGMT() / 60
         ]
+        if let screenshot { body["screenshot"] = screenshot }
         if let t = token {
             guard t.start >= 0, t.end <= caption.source.utf16.count, t.end > t.start,
                   (caption.source as NSString).substring(with: NSRange(location: t.start, length: t.end-t.start)) == t.surface

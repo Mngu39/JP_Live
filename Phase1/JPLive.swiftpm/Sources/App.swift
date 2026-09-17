@@ -36,19 +36,29 @@ struct TranscriptView: View {
                     Circle().fill(model.running ? Color.green : Color.secondary).frame(width: 6, height: 6)
                     Text(model.status).font(.caption).lineLimit(1)
                     Spacer(minLength: 0)
-                    if model.running { Button { Task { await model.stop() } } label: { Image(systemName: "stop.fill") }.accessibilityLabel("입력 중지") }
+                    if !model.captions.isEmpty {
+                        Button { model.clearTranscript() } label: { Image(systemName: "trash") }
+                            .accessibilityLabel("STT 내역 지우기")
+                    }
+                    if model.running {
+                        Button { Task { await model.stop(returnToHome: true) } } label: { Image(systemName: "stop.fill") }
+                            .accessibilityLabel("시스템 오디오 중지")
+                    }
                     Menu {
-                        Button("오디오 파일 열기", systemImage: "waveform") { importAudio = true }.disabled(model.running || model.changingLanguage)
                         #if PHASE2
-                        Button("시스템 오디오 시작", systemImage: "rectangle.inset.filled") {
-                            Task { await model.start(SystemAudioInput()) }
-                        }.disabled(model.running || model.changingLanguage)
+                        if !model.running {
+                            Button("시스템 오디오 시작", systemImage: "rectangle.inset.filled") {
+                                Task { await model.start(SystemAudioInput()) }
+                            }.disabled(model.changingLanguage)
+                        }
                         #endif
+                        Button("오디오 파일 열기", systemImage: "waveform") { importAudio = true }
+                            .disabled(model.running || model.changingLanguage)
                         Divider()
                         ForEach(SourceLanguage.allCases) { language in
                             Button { Task { await model.setLanguage(language) } } label: {
                                 if model.language == language { Label(language.title, systemImage: "checkmark") } else { Text(language.title) }
-                            }
+                            }.disabled(model.running || model.changingLanguage)
                         }
                         if model.language == .japanese {
                             Toggle("본문 후리가나", isOn: $model.showRuby)
@@ -68,11 +78,34 @@ struct TranscriptView: View {
                     ScrollView {
                         LazyVStack(spacing: 0) {
                             if model.captions.isEmpty {
-                                VStack(spacing: 12) {
+                                VStack(spacing: 14) {
                                     Image(systemName: "waveform").font(.largeTitle).foregroundStyle(.secondary)
                                     Text("원문과 한국어 번역을 함께 표시합니다.").font(.callout)
-                                    Text("… 메뉴에서 오디오 입력을 선택하세요.").font(.caption).foregroundStyle(.secondary)
-                                }.frame(maxWidth: .infinity).padding(.vertical, 40)
+                                    HStack(spacing: 10) {
+                                        #if PHASE2
+                                        Button {
+                                            Task { await model.start(SystemAudioInput()) }
+                                        } label: {
+                                            Label("시스템 오디오 시작", systemImage: "play.fill")
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .disabled(model.running || model.changingLanguage)
+                                        #else
+                                        Button("오디오 파일 열기", systemImage: "waveform") { importAudio = true }
+                                            .buttonStyle(.borderedProminent)
+                                            .disabled(model.running || model.changingLanguage)
+                                        #endif
+                                        Picker("언어", selection: Binding(
+                                            get: { model.language },
+                                            set: { next in Task { await model.setLanguage(next) } }
+                                        )) {
+                                            ForEach(SourceLanguage.allCases) { language in Text(language.code).tag(language) }
+                                        }
+                                        .pickerStyle(.segmented)
+                                        .frame(width: 132)
+                                        .disabled(model.running || model.changingLanguage)
+                                    }
+                                }.frame(maxWidth: .infinity).padding(.vertical, 44)
                             }
                             ForEach(model.captions) { row in
                                 Group {
@@ -135,7 +168,7 @@ struct TranscriptView: View {
     private func source(_ row: Caption) -> some View {
         RubyText(text: row.source, tokens: row.tokens, ruby: row.language == .japanese && model.showRuby) {
             selection = .init(row: row, token: $0)
-        }.opacity(row.isFinal ? 1 : 0.6)
+        }
     }
     private func gutterColor(_ hint: SpeakerGutterHint) -> Color {
         switch hint {

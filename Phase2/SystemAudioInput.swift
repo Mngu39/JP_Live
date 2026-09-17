@@ -1,6 +1,9 @@
 import Foundation
 @preconcurrency import AVFoundation
 import CoreMedia
+import UIKit
+import ImageIO
+import UniformTypeIdentifiers
 
 #if targetEnvironment(simulator)
 
@@ -12,6 +15,9 @@ import CoreMedia
 // fall back to this path.
 @MainActor
 final class SystemAudioInput: NSObject, AudioInput {
+    static func captureLearningScreenshot() async throws -> [String: Any] {
+        throw AppFailure.message("iOS Simulator에서는 화면 캡처를 사용할 수 없습니다.")
+    }
     func start() async throws -> AsyncThrowingStream<PCMChunk, Error> {
         throw AppFailure.message("iOS Simulator에서는 시스템 오디오 캡처를 사용할 수 없습니다.")
     }
@@ -26,6 +32,43 @@ final class SystemAudioInput: NSObject, AudioInput {
 // Physical iOS 27+ implementation. This file is never included in the Playground target.
 @MainActor
 final class SystemAudioInput: NSObject, AudioInput {
+    static func captureLearningScreenshot() async throws -> [String: Any] {
+        let image = try await SCScreenshotManager.captureImage(in: UIScreen.main.bounds)
+        let scaled = downscale(image, maxEdge: 1600)
+        let supported = CGImageDestinationCopyTypeIdentifiers() as NSArray
+        let type: UTType = supported.contains(UTType.webP.identifier) ? .webP : .jpeg
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, type.identifier as CFString, 1, nil) else {
+            throw AppFailure.message("저장용 스크린샷 인코더를 만들지 못했습니다.")
+        }
+        let properties = [kCGImageDestinationLossyCompressionQuality: 0.78] as CFDictionary
+        CGImageDestinationAddImage(destination, scaled, properties)
+        guard CGImageDestinationFinalize(destination) else {
+            throw AppFailure.message("저장용 스크린샷 인코딩에 실패했습니다.")
+        }
+        let bytes = data as Data
+        return [
+            "base64": bytes.base64EncodedString(),
+            "mime": type.preferredMIMEType ?? (type == .webP ? "image/webp" : "image/jpeg"),
+            "width": scaled.width, "height": scaled.height, "size_bytes": bytes.count,
+            "downscaled": scaled.width < image.width || scaled.height < image.height
+        ]
+    }
+
+    private static func downscale(_ image: CGImage, maxEdge: Int) -> CGImage {
+        let edge = max(image.width, image.height)
+        guard edge > maxEdge else { return image }
+        let ratio = CGFloat(maxEdge) / CGFloat(edge)
+        let size = CGSize(width: max(1, (CGFloat(image.width) * ratio).rounded()),
+                          height: max(1, (CGFloat(image.height) * ratio).rounded()))
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1
+        format.opaque = true
+        let rendered = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            UIImage(cgImage: image).draw(in: CGRect(origin: .zero, size: size))
+        }
+        return rendered.cgImage ?? image
+    }
     private var stream: SCStream?
     private var screenOutput: ScreenDiscardOutput?
     private var continuation: AsyncThrowingStream<PCMChunk, Error>.Continuation?
@@ -34,7 +77,11 @@ final class SystemAudioInput: NSObject, AudioInput {
     private var active = false
     private var selectionID = UUID()
     func start() async throws -> AsyncThrowingStream<PCMChunk, Error> {
-        let (sequence, continuation) = AsyncThrowingStream<PCMChunk, Error>.makeStream(bufferingPolicy: .bufferingOldest(150))
+        // System audio is loss-intolerant: do not kill a long live session merely
+        // because downstream work experiences a temporary burst. The live STT path
+        // is now decoupled from diarization, so this queue should remain near-empty
+        // in steady state; unbounded buffering is only a safety net for transient stalls.
+        let (sequence, continuation) = AsyncThrowingStream<PCMChunk, Error>.makeStream(bufferingPolicy: .unbounded)
         self.continuation = continuation
         active = true
         let delegate = CaptureDelegate(owner: self, continuation: continuation)
@@ -152,8 +199,15 @@ private final class CaptureDelegate: NSObject, SCContentSharingPickerObserver, S
         let time = pts-origin!
         do { _ = try clock.accept(time: time, frames: buffer.frameLength, rate: format.sampleRate) }
         catch { continuation.finish(throwing: error); return }
-        if case .dropped = continuation.yield(PCMChunk(buffer: buffer, time: time)) {
-            continuation.finish(throwing: AppFailure.message("시스템 오디오 처리 큐가 가득 찼습니다."))
+        switch continuation.yield(PCMChunk(buffer: buffer, time: time)) {
+        case .terminated: return
+        case .enqueued: break
+        case .dropped:
+            // .unbounded never drops under the current policy. Keep an explicit
+            // failure if that policy changes in the future rather than losing PCM silently.
+            continuation.finish(throwing: AppFailure.message("시스템 오디오 입력이 유실되었습니다."))
+        @unknown default:
+            continuation.finish(throwing: AppFailure.message("알 수 없는 시스템 오디오 입력 상태"))
         }
     }
 }

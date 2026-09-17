@@ -129,3 +129,52 @@ struct LogsWebView: UIViewRepresentable {
         }
     }
 }
+
+
+struct DictionaryScreen: View {
+    let term: String
+    let url: URL
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        NavigationStack {
+            DictionaryWebView(url: url)
+                .navigationTitle(term)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { Button("닫기") { dismiss() } }
+        }
+        .presentationDetents([.large])
+    }
+}
+
+struct DictionaryWebView: UIViewRepresentable {
+    let url: URL
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        let web = WKWebView(frame: .zero, configuration: config)
+        web.navigationDelegate = context.coordinator
+        web.uiDelegate = context.coordinator
+        web.allowsBackForwardNavigationGestures = true
+        web.load(URLRequest(url: url))
+        return web
+    }
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) { uiView.stopLoading() }
+
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+        func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
+                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            guard let url = action.request.url else { decisionHandler(.cancel); return }
+            if url.scheme == "https" || url.scheme == "http" || url.scheme == "about" {
+                decisionHandler(.allow)
+            } else {
+                decisionHandler(.cancel)
+            }
+        }
+        func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                     for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+            if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
+            return nil
+        }
+    }
+}

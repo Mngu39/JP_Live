@@ -105,7 +105,12 @@ actor WorkerClient {
         guard caption.language == .japanese else { throw AppFailure.message("AI 재구성은 일본어 전용입니다.") }
         let morphs = try JSONSerialization.jsonObject(with: JSONEncoder().encode(tokens))
         let data = try await request("/run/restructure", body: ["text":caption.source,"deepl_translation":translation,"morphs":morphs])
-        let result = try JSONDecoder().decode(Reconstruction.self, from: data)
+        var result = try JSONDecoder().decode(Reconstruction.self, from: data)
+        result.units = result.units.map { unit in
+            var normalized = unit
+            normalized.reading = JapaneseText.hiragana(unit.reading)
+            return normalized
+        }
         guard result.units.map(\.surface).joined() == caption.source else { throw AppFailure.message("AI 결과의 원문이 일치하지 않습니다.") }
         return result
     }

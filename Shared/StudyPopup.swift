@@ -1,5 +1,11 @@
 import SwiftUI
 
+private struct DictionaryDestination: Identifiable {
+    let id = UUID()
+    let term: String
+    let url: URL
+}
+
 struct StudyPopup: View {
     let selection: PopupSelection
     @EnvironmentObject private var app: AppModel
@@ -18,6 +24,7 @@ struct StudyPopup: View {
     @State private var saveStatus = ""
     @State private var choosingSession = false
     @State private var expandedKanji: String?
+    @State private var dictionaryDestination: DictionaryDestination?
     init(selection: PopupSelection) {
         self.selection = selection
         _token = State(initialValue: selection.token)
@@ -34,8 +41,15 @@ struct StudyPopup: View {
                     if let token {
                         let term = useAI ? token.surface : token.lemma
                         let reading = row.language == .japanese ? (useAI || token.lemma == token.surface ? token.reading : (lemmaReadingKey == selectedKey ? lemmaReading : "")) : ""
-                        RubyText(text: term, tokens: [.init(surface: term, lemma: term, reading: reading, start: 0, end: term.utf16.count)],
-                            ruby: row.language == .japanese, size: 28) { _ in }
+                        if row.language == .japanese {
+                            Button { openDictionary(term) } label: {
+                                RubyText(text: term, tokens: [.init(surface: term, lemma: term, reading: reading, start: 0, end: term.utf16.count)],
+                                    ruby: true, size: 28) { _ in }
+                            }.buttonStyle(.plain)
+                        } else {
+                            RubyText(text: term, tokens: [.init(surface: term, lemma: term, reading: "", start: 0, end: term.utf16.count)],
+                                ruby: false, size: 28) { _ in }
+                        }
                         if !useAI && token.surface != token.lemma { Text("표면형: \(token.surface)").foregroundStyle(.secondary) }
                         Text(meaning.isEmpty ? (error.isEmpty ? "뜻 불러오는 중…" : "뜻을 불러오지 못했습니다.") : meaning).font(.title3)
                         if useAI, let note = token.note, !note.isEmpty { Text(note).foregroundStyle(.secondary) }
@@ -56,13 +70,13 @@ struct StudyPopup: View {
                     if !error.isEmpty { Text(error).foregroundStyle(.red).font(.callout) }
                     if !saveStatus.isEmpty { Text(saveStatus).foregroundStyle(.secondary).font(.callout) }
                     if row.language == .japanese {
-                        if !row.isFinal { Text("인식 중인 자막입니다. 확정된 자막을 다시 열면 저장할 수 있습니다.").font(.caption) }
+                        if !row.isFinal { Text("인식 중인 자막 · 현재 표시된 내용을 저장합니다.").font(.caption).foregroundStyle(.secondary) }
                         HStack {
                             Button("최근 세션에 저장", systemImage: "square.and.arrow.down") {
                                 if let session = app.selectedSession() { Task { await save(session) } }
                                 else { choosingSession = true }
-                            }.buttonStyle(.borderedProminent).disabled(busy || !row.isFinal || baseTokens.isEmpty)
-                            Button("세션 선택", systemImage: "plus") { choosingSession = true }.buttonStyle(.bordered).disabled(busy || !row.isFinal || baseTokens.isEmpty)
+                            }.buttonStyle(.borderedProminent).disabled(busy || baseTokens.isEmpty)
+                            Button("세션 선택", systemImage: "plus") { choosingSession = true }.buttonStyle(.bordered).disabled(busy || baseTokens.isEmpty)
                         }
                     }
                 }.padding(22)
@@ -90,6 +104,9 @@ struct StudyPopup: View {
                     choosingSession = false
                     Task { await save(session) }
                 }
+            }
+            .sheet(item: $dictionaryDestination) { destination in
+                DictionaryScreen(term: destination.term, url: destination.url)
             }
             .task {
                 guard baseTokens.isEmpty else { return }
@@ -132,16 +149,45 @@ struct StudyPopup: View {
         ForEach(unique, id: \.self) { ch in
             let deck = LearningData.deck[ch]
             let db = LearningData.kanji[ch]
-            let gloss = deck?["mean"] ?? db?["훈음"] ?? [db?["음"], db?["훈"]].compactMap { $0 }.joined(separator: " · ")
+            let gloss = deck?["mean"] ?? [db?["음"], db?["훈"]]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }.joined(separator: " · ")
             if let deck {
                 DisclosureGroup(isExpanded: Binding(get: { expandedKanji == ch }, set: { expandedKanji = $0 ? ch : nil })) {
-                    Text(deck["explain"] ?? "").frame(maxWidth: .infinity, alignment: .leading)
+                    let unit = (deck["unit"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let explanation = deckExplanation(deck)
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(explanation.isEmpty ? "(설명 없음)" : explanation)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if !unit.isEmpty {
+                            Text("#\(unit)").font(.caption2).fontWeight(.semibold)
+                                .padding(.horizontal, 7).padding(.vertical, 3)
+                                .background(.secondary.opacity(0.12), in: Capsule())
+                        }
+                    }
                 } label: { Text("\(ch) · \(gloss)") }
             } else {
-                let escaped = ch.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ch
-                Link("\(ch) · \(gloss)", destination: URL(string: "https://hanja.dict.naver.com/hanja?q=\(escaped)")!)
+                Button { openDictionary(ch) } label: {
+                    Text(gloss.isEmpty ? ch : "\(ch) · \(gloss)")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }.buttonStyle(.plain)
             }
         }
+    }
+    private func openDictionary(_ term: String) {
+        let query = term.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? term
+        guard let url = URL(string: "https://ja.dict.naver.com/#/search?range=all&query=\(query)") else { return }
+        dictionaryDestination = DictionaryDestination(term: term, url: url)
+    }
+    private func deckExplanation(_ deck: [String: String]) -> String {
+        var text = (deck["explain"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let unit = (deck["unit"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let suffix = "#" + unit
+        if !unit.isEmpty, text.hasSuffix(suffix) {
+            text.removeLast(suffix.count)
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return text
     }
     private func toggleAI() async {
         error = ""
@@ -161,15 +207,20 @@ struct StudyPopup: View {
         guard !busy, !baseTokens.isEmpty else { return }
         busy = true; error = ""; saveStatus = ""; defer { busy = false }
         let savedToken = token, savedTokens = tokens
+        let screenshot = await app.learningScreenshot()
         var savedTranslation = translation
         do {
             if savedTranslation.isEmpty {
                 savedTranslation = try await WorkerClient.shared.translate(row.source, language: row.language)
                 baseTranslation = savedTranslation
             }
-            let payload = try SavePayload.make(caption: row, session: session, token: savedToken, tokens: savedTokens, translation: savedTranslation)
+            let payload = try SavePayload.make(caption: row, session: session, token: savedToken, tokens: savedTokens,
+                translation: savedTranslation, screenshot: screenshot)
             try await WorkerClient.shared.save(payload)
-            app.selectSession(session); saveStatus = "\(session.displayTitle)에 저장했습니다."
+            app.selectSession(session)
+            saveStatus = screenshot == nil
+                ? "\(session.displayTitle)에 저장했습니다. · 스크린샷 캡처 실패"
+                : "\(session.displayTitle)에 저장했습니다."
         } catch { self.error = "저장 확인 실패: \(error.localizedDescription)" }
     }
 }

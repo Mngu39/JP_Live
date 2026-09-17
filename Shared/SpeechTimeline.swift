@@ -18,6 +18,7 @@ struct SpeechDecision: Sendable, Equatable {
 
 struct SpeechTimeline: Sendable {
     private(set) var frames: [SpeechDecision] = []
+    var latestEnd: Double? { frames.last?.end }
     // Covers delayed recognizer callbacks, while bounding per-capture history.
     private let retention: Double = 120
     private let tolerance: Double = 1.0 / 24000

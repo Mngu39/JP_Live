@@ -16,7 +16,6 @@ protocol EnhancementProvider: Actor {
 private struct PendingAudio {
     var samples: [Float]
     var start: Double
-    var enqueuedAt: Double
     var decision: SpeechDecision? = nil
     var end: Double { start + Double(samples.count)/48000 }
 }
@@ -30,6 +29,7 @@ actor AudioPreprocessor {
     private var pending: [PendingAudio] = []
     private var enhancementLedger: [PendingAudio] = []
     private var timeline = SpeechTimeline()
+    private var analysisUpdates: [SpeechDecision] = []
     private var lastInputEnd: Double?
     private var analysisOrigin: Double?
     private var analysisGeneration = UUID()
@@ -40,7 +40,6 @@ actor AudioPreprocessor {
     private var enhancementStartsAt: Double?
     private var analysis: (any SpeechAnalysisProvider)?
     private var enhancement: (any EnhancementProvider)?
-    private let maxAnalysisWait: Double = 2
 
     func setProviders(analysis: (any SpeechAnalysisProvider)?, enhancement: (any EnhancementProvider)?) async {
         analysisInput?.finish(); analysisTask?.cancel(); await analysisTask?.value
@@ -50,7 +49,9 @@ actor AudioPreprocessor {
         analysisInput = nil; analysisTask = nil
         guard let analysis else { return }
         let generation = analysisGeneration
-        let (stream, continuation) = AsyncStream<([Float], Double)>.makeStream(bufferingPolicy: .bufferingOldest(30))
+        // Optional diarization may lag without blocking STT. Absorb a short burst,
+        // then degrade only the optional analysis path if it cannot keep up.
+        let (stream, continuation) = AsyncStream<([Float], Double)>.makeStream(bufferingPolicy: .bufferingOldest(150))
         analysisInput = continuation
         analysisTask = Task {
             var origin: Double?
@@ -60,13 +61,17 @@ actor AudioPreprocessor {
                     let frames = try await analysis.process(samples, sampleRate: 48000)
                     try Task.checkCancellation()
                     guard self.analysisGeneration == generation else { return }
-                    self.timeline.append(frames.map { $0.shifted(by: base) })
+                    let shifted = frames.map { $0.shifted(by: base) }
+                    self.timeline.append(shifted)
+                    self.analysisUpdates.append(contentsOf: shifted)
                 }
                 try Task.checkCancellation()
                 let tail = try await analysis.finish()
                 try Task.checkCancellation()
                 if let origin, self.analysisGeneration == generation {
-                    self.timeline.append(tail.map { $0.shifted(by: origin) })
+                    let shifted = tail.map { $0.shifted(by: origin) }
+                    self.timeline.append(shifted)
+                    self.analysisUpdates.append(contentsOf: shifted)
                 }
             } catch {
                 guard !Task.isCancelled, self.analysisGeneration == generation else { return }
@@ -144,12 +149,12 @@ actor AudioPreprocessor {
             @unknown default: break
             }
         }
-        let now = ProcessInfo.processInfo.systemUptime
-        // Match in short intervals; never assign the newest speaker frame to a whole old buffer.
+        // Keep 10 ms render slices, but never hold them waiting for diarization.
+        // Speaker analysis is a parallel metadata path and may arrive later.
         for offset in stride(from: 0, to: mono.count, by: 480) {
             let count = min(480, mono.count-offset)
             pending.append(PendingAudio(samples: Array(mono[offset..<offset+count]),
-                start: chunk.time+Double(offset)/48000, enqueuedAt: now))
+                start: chunk.time+Double(offset)/48000))
         }
         return AudioMetrics(time: chunk.time,
             rmsDB: 20*log10(Double(max(rms, 0.000001))), peakDB: 20*log10(Double(max(peak, 0.000001))))
@@ -157,13 +162,10 @@ actor AudioPreprocessor {
     private func drain(force: Bool) async -> [PCMChunk] {
         var outputs: [PCMChunk] = []
         while var frame = pending.first {
+            // Opportunistically use analysis that has already arrived, but never wait for
+            // it. This keeps the STT transport real-time while FluidAudio continues in
+            // parallel and publishes speaker metadata through takeAnalysisUpdates().
             frame.decision = timeline.decision(start: frame.start, end: frame.end)
-            if frame.decision == nil && !force && analysisInput != nil {
-                let inputLag = (lastInputEnd ?? frame.end)-frame.start
-                let wait = ProcessInfo.processInfo.systemUptime-frame.enqueuedAt
-                if inputLag < maxAnalysisWait && wait < maxAnalysisWait { break }
-                disableAnalysis("화자 분석 대기 2초 초과 · 기본 STT 유지")
-            }
             pending.removeFirst()
             let enhancementEligible = enhancementStartsAt.map { frame.start >= $0-1.0/48000 } ?? true
             let mix: Float = enhancementEligible && frame.decision?.activeSpeakers == 1 && (frame.decision?.speechProbability ?? 0) >= 0.65 ? 0.35 : 0
@@ -223,6 +225,11 @@ actor AudioPreprocessor {
         let frames = enhancementLedger; enhancementLedger = []
         return frames.map { render($0) }
     }
+    func takeAnalysisUpdates() -> [SpeechDecision] {
+        let updates = analysisUpdates
+        analysisUpdates.removeAll(keepingCapacity: true)
+        return updates
+    }
     func finish(cancelAnalysis: Bool = false) async throws -> [PCMChunk] {
         guard !closed else { return [] }
         closed = true
@@ -233,7 +240,7 @@ actor AudioPreprocessor {
         analysisInput?.finish(); analysisInput = nil; analysisTask?.cancel()
         await analysisTask?.value; analysisTask = nil
         _ = await enhancement?.recoverUnprocessed()
-        pending = []; enhancementLedger = []; floatConverter = nil; ring = []
+        pending = []; enhancementLedger = []; floatConverter = nil; ring = []; analysisUpdates = []
     }
     private func finishSegment(cancelAnalysis: Bool) async throws -> [PCMChunk] {
         for tail in try floatConverter?.flush() ?? [] { _ = try enqueue(tail) }

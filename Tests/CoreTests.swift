@@ -121,7 +121,10 @@ final class CoreTests: XCTestCase {
     }
     func testContinuationBoundaryAndLosslessSplit() {
         XCTAssertFalse(ChunkBoundary.shouldCommit("そうだけど", pause: 0.7, duration: 3, language: .japanese))
-        XCTAssertTrue(ChunkBoundary.shouldCommit("そうです。", pause: 0, duration: 1, language: .japanese))
+        XCTAssertFalse(ChunkBoundary.shouldCommit("そうです。", pause: 0, duration: 1, language: .japanese))
+        XCTAssertTrue(ChunkBoundary.shouldCommit("そうです。", pause: 0.3, duration: 1, language: .japanese))
+        XCTAssertFalse(ChunkBoundary.shouldCommit("息を吸って続ける", pause: 0.5, duration: 3, language: .japanese))
+        XCTAssertTrue(ChunkBoundary.shouldCommit("ここで区切る", pause: 0.8, duration: 3, language: .japanese))
         let long = String(repeating: "これはテストです。", count: 30)
         XCTAssertEqual(ChunkBoundary.split(long, limit: 110).joined(), long)
     }
@@ -150,7 +153,8 @@ final class CoreTests: XCTestCase {
         buffer.begin(captureID: UUID(), language: .japanese)
         XCTAssertTrue(buffer.receive("今日は", final: false, start: 0, end: 1, speaker: nil, now: 0).isEmpty)
         let draftID = buffer.rows[0].id
-        let ready = buffer.receive("今日は晴れです。", final: true, start: 0, end: 2, speaker: nil, now: 1)
+        XCTAssertTrue(buffer.receive("今日は晴れです。", final: true, start: 0, end: 2, speaker: nil, now: 1).isEmpty)
+        let ready = buffer.tick(now: 1.31)
         XCTAssertEqual(ready, [draftID])
         XCTAssertEqual(buffer.rows.count, 1)
         XCTAssertEqual(buffer.rows[0].id, draftID)
@@ -175,19 +179,33 @@ final class CoreTests: XCTestCase {
         var buffer = TranscriptBuffer()
         buffer.begin(captureID: UUID(), language: .japanese)
         _ = buffer.receive("はい。", final: true, start: 0, end: 1, speaker: nil, now: 0)
+        _ = buffer.tick(now: 0.31)
         _ = buffer.finish()
         let group = buffer.rows[0].contextGroup
         buffer.begin(captureID: UUID(), language: .japanese)
         _ = buffer.receive("はい。", final: true, start: 0, end: 1, speaker: nil, now: 0)
+        _ = buffer.tick(now: 0.31)
         XCTAssertEqual(buffer.rows.count, 2)
         XCTAssertNotEqual(buffer.rows[1].contextGroup, group)
     }
-    func testUnfinalizedAndEnglishCaptionsCannotBeSaved() {
+    func testDraftJapaneseCanBeSavedButEnglishCannot() throws {
         let session = LearningSession(id: "s", title: nil, raw_url: nil, session_key: nil)
-        for (language, final) in [(SourceLanguage.japanese, false), (.english, true)] {
-            let row = Caption(captureID: UUID(), language: language, source: "test", start: 0, end: 1, isFinal: final)
-            XCTAssertThrowsError(try SavePayload.make(caption: row, session: session, token: nil, tokens: [], translation: ""))
-        }
+        let draft = Caption(captureID: UUID(), language: .japanese, source: "途中", start: 0, end: 1, isFinal: false)
+        XCTAssertNoThrow(try SavePayload.make(caption: draft, session: session, token: nil, tokens: [], translation: "도중"))
+        let english = Caption(captureID: UUID(), language: .english, source: "test", start: 0, end: 1, isFinal: true)
+        XCTAssertThrowsError(try SavePayload.make(caption: english, session: session, token: nil, tokens: [], translation: ""))
+    }
+    func testLearningScreenshotPayloadIsForwarded() throws {
+        let row = Caption(captureID: UUID(), language: .japanese, source: "保存", start: 0, end: 1, isFinal: false)
+        let session = LearningSession(id: "s", title: nil, raw_url: nil, session_key: nil)
+        let screenshot: [String: Any] = ["base64":"YWJj", "mime":"image/webp", "width":1600, "height":900, "size_bytes":3, "downscaled":true]
+        let payload = try SavePayload.make(caption: row, session: session, token: nil, tokens: [], translation: "저장", screenshot: screenshot)
+        let saved = payload["screenshot"] as? [String: Any]
+        XCTAssertEqual(saved?["mime"] as? String, "image/webp")
+        XCTAssertEqual(saved?["width"] as? Int, 1600)
+    }
+    func testAIReadingNormalizationUsesHiragana() {
+        XCTAssertEqual(JapaneseText.hiragana("カタカナ・ABC"), "かたかな・ABC")
     }
     func testEnglishChunkJoiningDoesNotDoubleWhitespace() {
         var buffer = TranscriptBuffer()
@@ -264,6 +282,16 @@ final class CoreTests: XCTestCase {
             XCTAssertTrue(buffer.rows.isEmpty)
         }
     }
+    func testPunctuationOnlyRecognizerResultNeverCreatesStandaloneCaption() {
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
+        XCTAssertTrue(buffer.receive(".", final: true, start: 0, end: 0.1, speaker: nil, now: 0).isEmpty)
+        XCTAssertTrue(buffer.rows.isEmpty)
+        _ = buffer.receive("今日は", final: true, start: 0.2, end: 1, speaker: nil, now: 0.2)
+        XCTAssertTrue(buffer.receive("。", final: true, start: 1, end: 1.01, speaker: nil, now: 0.3).isEmpty)
+        XCTAssertEqual(buffer.rows.map(\.source), ["今日は。"] )
+        XCTAssertEqual(buffer.tick(now: 0.61).count, 1)
+    }
+
     func testRevocationPreservesFinalPrefixIdentityAndTiming() {
         var buffer = TranscriptBuffer()
         buffer.begin(captureID: UUID(), language: .japanese)
@@ -287,6 +315,7 @@ final class CoreTests: XCTestCase {
         var buffer = TranscriptBuffer()
         buffer.begin(captureID: UUID(), language: .japanese)
         _ = buffer.receive("はい。", final: true, start: 0, end: 1, speaker: nil, now: 0)
+        _ = buffer.tick(now: 0.31)
         buffer.rows[0].translation = "네."
         let id = buffer.rows[0].id
         _ = buffer.receive("誤認識", final: false, start: 1, end: 2, speaker: nil, now: 0.5)
@@ -314,7 +343,8 @@ final class CoreTests: XCTestCase {
         _ = buffer.receive("noise", final: false, start: 0, end: 1, speaker: nil, now: 0)
         let discardedGroup = buffer.rows[0].contextGroup
         _ = buffer.receive("", final: false, start: 0, end: 1.1, speaker: nil, now: 1)
-        let ready = buffer.receive("Hello.", final: true, start: 2, end: 3, speaker: nil, now: 2)
+        XCTAssertTrue(buffer.receive("Hello.", final: true, start: 2, end: 3, speaker: nil, now: 2).isEmpty)
+        let ready = buffer.tick(now: 2.31)
         XCTAssertEqual(buffer.rows.count, 1)
         XCTAssertEqual(ready, [buffer.rows[0].id])
         XCTAssertEqual(buffer.rows[0].source, "Hello.")
@@ -417,6 +447,39 @@ final class CoreTests: XCTestCase {
             XCTAssertEqual(buffer.rows.count, first == nil ? 1 : 2)
         }
     }
+    func testShortSpeakerJitterDoesNotSplitButSustainedTurnCan() {
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
+        _ = buffer.receive("昨日", final: true, start: 0, end: 1, speaker: 0, now: 0)
+        XCTAssertTrue(buffer.receive("あ", final: true, start: 1, end: 1.15, speaker: 1, now: 0.1).isEmpty)
+        XCTAssertEqual(buffer.rows.count, 1)
+
+        var sustained = TranscriptBuffer(); sustained.begin(captureID: UUID(), language: .japanese)
+        _ = sustained.receive("昨日", final: true, start: 0, end: 1, speaker: 0, now: 0)
+        XCTAssertEqual(sustained.receive("ゲーム", final: true, start: 1, end: 1.4, speaker: 1, now: 0.1).count, 1)
+        XCTAssertEqual(sustained.rows.count, 2)
+    }
+
+    func testLateSpeakerTimelineUpdatesVisibleCaptionWithoutHoldingSTT() {
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
+        _ = buffer.receive("昨日ゲームをした", final: true, start: 0, end: 1, speaker: nil, now: 0)
+        var timeline = SpeechTimeline()
+        timeline.append([SpeechDecision(speechProbability: 1, activeSpeakers: 1, start: 0, end: 1, speakerSlot: 2)])
+        let changed = buffer.applySpeakerTimeline(timeline)
+        XCTAssertEqual(changed, [buffer.rows[0].id])
+        XCTAssertEqual(buffer.rows[0].speaker, 2)
+    }
+
+    func testClearDisplayResetsVisibleChunkWithoutEndingCapture() {
+        let capture = UUID()
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: capture, language: .japanese)
+        _ = buffer.receive("前の字幕", final: true, start: 0, end: 1, speaker: nil, now: 0)
+        buffer.clearDisplay()
+        XCTAssertTrue(buffer.rows.isEmpty)
+        _ = buffer.receive("新しい字幕", final: true, start: 1, end: 2, speaker: nil, now: 1)
+        XCTAssertEqual(buffer.rows.count, 1)
+        XCTAssertEqual(buffer.rows[0].captureID, capture)
+    }
+
     func testTimelineGapsAndMixedSpeakersRemainUnknown() {
         var timeline = SpeechTimeline()
         timeline.append([
@@ -437,24 +500,23 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(timeline.activity(through: 2.5)?.silence, 0.5)
         XCTAssertNil(timeline.activity(through: 3))
     }
-    func testDelayedAnalysisAppliesToBufferedOriginalAudio() async throws {
+    func testDelayedAnalysisNeverHoldsLivePCMAndPublishesMetadataLater() async throws {
         let pipeline = AudioPreprocessor()
         await pipeline.setProviders(analysis: PatternAnalysis(delay: 0.9, voicedUntil: 0.1), enhancement: nil)
         var outputs: [PCMChunk] = []
         for index in 0..<12 {
             let (next, _) = try await pipeline.process(Self.pcm(count: 4800, time: Double(index)/10))
+            XCTAssertFalse(next.isEmpty)
             outputs += next
         }
         outputs += try await pipeline.finish()
+        let analysis = await pipeline.takeAnalysisUpdates()
         XCTAssertEqual(outputs.reduce(0) { $0+Int($1.buffer.frameLength) }, 57600)
         XCTAssertEqual(outputs.first?.time, 0)
-        XCTAssertEqual(outputs.first?.decision?.speakerSlot, 0)
-        XCTAssertEqual(outputs.first?.decision?.speechProbability, 1)
-        for output in outputs where output.time >= 0.1-0.00001 {
-            XCTAssertEqual(output.decision?.speechProbability, 0)
-            XCTAssertNil(output.decision?.speakerSlot)
-        }
-        XCTAssertGreaterThan(Self.samples(Array(outputs.prefix(10))).max() ?? 0, 0.01)
+        XCTAssertTrue(outputs.allSatisfy { $0.decision == nil })
+        XCTAssertFalse(analysis.isEmpty)
+        XCTAssertTrue(analysis.contains { $0.speakerSlot == 0 && $0.speechProbability == 1 })
+        XCTAssertTrue(analysis.contains { $0.start >= 0.1-0.00001 && $0.speechProbability == 0 })
     }
     func testEnhancerIsNotCalledWhenAnalysisIsMissing() async throws {
         let pipeline = AudioPreprocessor(), enhancer = CountingEnhancer()
@@ -465,42 +527,43 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(counts.process, 0); XCTAssertEqual(counts.finish, 0)
         XCTAssertEqual(Self.samples(outputs+tail), [Float](repeating: 0.01, count: 4800))
     }
-    func testEnhancerBypassRestoresTailAndNeverProcessesSilentInterval() async throws {
+    func testAnalysisConditionedEnhancerNeverBlocksImmediateLivePCM() async throws {
         let pipeline = AudioPreprocessor(), enhancer = CountingEnhancer()
         await pipeline.setProviders(analysis: PatternAnalysis(voicedUntil: 0.1), enhancement: enhancer)
         let (early, _) = try await pipeline.process(Self.pcm(count: 9600, time: 0, amplitude: 0.2))
         let outputs = early + (try await pipeline.finish())
         let counts = await enhancer.counts()
-        XCTAssertEqual(counts.process, 10)
-        XCTAssertEqual(counts.finish, 0)
-        XCTAssertEqual(counts.reset, 1)
+        XCTAssertEqual(counts.process, 0)
         XCTAssertEqual(Self.samples(outputs).count, 9600)
         XCTAssertTrue(Self.samples(outputs).allSatisfy { abs($0-0.2) < 0.0001 })
         for (index, output) in outputs.enumerated() { XCTAssertEqual(output.time, Double(index)/100, accuracy: 0.00001) }
+        XCTAssertFalse((await pipeline.takeAnalysisUpdates()).isEmpty)
     }
-    func testAnalysisBudgetFallsBackWithoutDroppingAudio() async throws {
+    func testAnalysisDelayHasNoTwoSecondGateAndDropsNoAudio() async throws {
         let pipeline = AudioPreprocessor()
         await pipeline.setProviders(analysis: PatternAnalysis(delay: 100), enhancement: nil)
-        var outputs: [PCMChunk] = []; var sawWarning = false
+        var outputs: [PCMChunk] = []; var sawOldWaitWarning = false
         for index in 0..<30 {
             let (next, state) = try await pipeline.process(Self.pcm(count: 4800, time: Double(index)/10))
-            outputs += next; sawWarning = sawWarning || state.warnings.contains(where: { $0.contains("2초") })
+            XCTAssertFalse(next.isEmpty)
+            outputs += next; sawOldWaitWarning = sawOldWaitWarning || state.warnings.contains(where: { $0.contains("2초") })
         }
         outputs += try await pipeline.finish()
-        XCTAssertTrue(sawWarning)
+        XCTAssertFalse(sawOldWaitWarning)
         XCTAssertEqual(Self.samples(outputs).count, 144000)
         XCTAssertTrue(outputs.allSatisfy { $0.decision == nil })
     }
-    func testShortInputFlushesAnalysisAndEnhancementTail() async throws {
+    func testShortInputFlushesAnalysisMetadataWithoutHoldingAudio() async throws {
         let pipeline = AudioPreprocessor(), enhancer = CountingEnhancer()
         await pipeline.setProviders(analysis: PatternAnalysis(delay: 0.9), enhancement: enhancer)
         let (early, _) = try await pipeline.process(Self.pcm(count: 720, time: 3, amplitude: 0.2))
+        XCTAssertFalse(early.isEmpty)
         let outputs = early + (try await pipeline.finish())
         let counts = await enhancer.counts()
         XCTAssertEqual(Self.samples(outputs).count, 720)
         XCTAssertEqual(outputs.first?.time, 3)
-        XCTAssertEqual(counts.finish, 1)
-        XCTAssertTrue(outputs.allSatisfy { $0.decision?.speakerSlot == 0 })
+        XCTAssertEqual(counts.process, 0)
+        XCTAssertFalse((await pipeline.takeAnalysisUpdates()).isEmpty)
     }
     func testMixedBypassImmediatelyDropsPreviousSpeechGainButKeepsLimiter() {
         var leveler = SpeechLeveler()
@@ -512,33 +575,30 @@ final class CoreTests: XCTestCase {
         let loud = leveler.process([Float](repeating: 3, count: 480), speechProbability: 1, allowUpwardGain: false)
         XCTAssertTrue(loud.allSatisfy { abs($0) <= 0.98 })
     }
-    func testPipelineOverlapDoesNotBoostMixedAudioOrRunEnhancer() async throws {
+    func testPipelineOverlapMetadataRunsInParallelWithoutBoostingLivePCM() async throws {
         for active in [2, 3] {
             let pipeline = AudioPreprocessor(), enhancer = CountingEnhancer()
             await pipeline.setProviders(analysis: PatternAnalysis(voicedUntil: 0.1, laterSpeakers: active), enhancement: enhancer)
             let (early, _) = try await pipeline.process(Self.pcm(count: 9600, time: 0))
             let outputs = early + (try await pipeline.finish())
             let counts = await enhancer.counts()
-            XCTAssertEqual(Self.samples(outputs).count, 9600)
-            XCTAssertGreaterThan(Self.samples(outputs.filter { $0.time < 0.1-0.00001 }).max() ?? 0, 0.01)
-            let overlap = outputs.filter { $0.time >= 0.1-0.00001 }
-            XCTAssertEqual(Self.samples(overlap), [Float](repeating: 0.01, count: 4800))
-            XCTAssertTrue(overlap.allSatisfy { $0.decision?.activeSpeakers == active && $0.decision?.speechProbability == 1 })
-            XCTAssertEqual(counts.process, 10)
-            XCTAssertEqual(counts.finish, 0)
+            let analysis = await pipeline.takeAnalysisUpdates()
+            XCTAssertEqual(Self.samples(outputs), [Float](repeating: 0.01, count: 9600))
+            XCTAssertTrue(outputs.allSatisfy { $0.decision == nil })
+            XCTAssertTrue(analysis.contains { $0.activeSpeakers == active })
+            XCTAssertEqual(counts.process, 0)
         }
     }
-    func testPipelineSilenceDoesNotInheritSingleSpeakerGain() async throws {
+    func testPipelineSilenceMetadataDoesNotDelayOrAlterLivePCM() async throws {
         let pipeline = AudioPreprocessor()
         await pipeline.setProviders(analysis: PatternAnalysis(voicedUntil: 0.1), enhancement: nil)
         let (early, _) = try await pipeline.process(Self.pcm(count: 9600, time: 0))
         let outputs = early + (try await pipeline.finish())
-        XCTAssertGreaterThan(Self.samples(outputs.filter { $0.time < 0.1-0.00001 }).max() ?? 0, 0.01)
-        XCTAssertEqual(Self.samples(outputs.filter { $0.time >= 0.1-0.00001 }), [Float](repeating: 0.01, count: 4800))
+        XCTAssertEqual(Self.samples(outputs), [Float](repeating: 0.01, count: 9600))
+        let analysis = await pipeline.takeAnalysisUpdates()
+        XCTAssertTrue(analysis.contains { $0.speechProbability == 0 })
     }
-    func testKnownSpeakerChangeDoesNotPassQuietSpeakerGainToLoudSpeaker() async throws {
-        // Also exercise a delayed enhancer output: reset must follow original
-        // audio order, including the first B frame emitted from its output ledger.
+    func testKnownSpeakerChangeMetadataDoesNotGateDifferentVolumePCM() async throws {
         for useEnhancer in [false, true] {
             let pipeline = AudioPreprocessor()
             let enhancer: (any EnhancementProvider)? = useEnhancer ? CountingEnhancer() : nil
@@ -546,15 +606,11 @@ final class CoreTests: XCTestCase {
             let (a, _) = try await pipeline.process(Self.pcm(count: 4800, time: 0, amplitude: 0.01))
             let (b, _) = try await pipeline.process(Self.pcm(count: 4800, time: 0.1, amplitude: 0.2))
             let outputs = a + b + (try await pipeline.finish())
-            let quiet = outputs.filter { $0.time < 0.1-0.00001 }
-            let loud = outputs.filter { $0.time >= 0.1-0.00001 }
-            XCTAssertEqual(Self.samples(outputs).count, 9600)
-            XCTAssertGreaterThan(Self.samples(quiet).max() ?? 0, 0.03)
-            XCTAssertEqual(loud.first?.time ?? -1, 0.1, accuracy: 0.00001)
-            XCTAssertTrue(quiet.allSatisfy { $0.decision?.speakerSlot == 0 })
-            XCTAssertTrue(loud.allSatisfy { $0.decision?.speakerSlot == 2 && $0.decision?.activeSpeakers == 1 })
-            // Exact equality includes B's first sample, not merely its steady state.
-            XCTAssertEqual(Self.samples(loud), [Float](repeating: 0.2, count: 4800))
+            XCTAssertEqual(Self.samples(a), [Float](repeating: 0.01, count: 4800))
+            XCTAssertEqual(Self.samples(b), [Float](repeating: 0.2, count: 4800))
+            let analysis = await pipeline.takeAnalysisUpdates()
+            XCTAssertTrue(analysis.contains { $0.speakerSlot == 0 })
+            XCTAssertTrue(analysis.contains { $0.speakerSlot == 2 })
         }
     }
     func testUnknownOrLowConfidenceSlotDoesNotResetOrReplaceKnownSpeaker() {
@@ -654,34 +710,26 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(raw.allSatisfy { $0.decision == nil })
         await pipeline.installPrepared(analysis: PatternAnalysis(delay: 0.1), enhancement: nil)
         let (next, _) = try await pipeline.process(Self.pcm(count: 9600, time: 5.1, amplitude: 0.2))
-        let analyzed = next + (try await pipeline.finish())
-        XCTAssertEqual(Self.samples(raw + analyzed), [Float](repeating: 0.2, count: 14400))
-        XCTAssertEqual(analyzed.first?.time ?? -1, 5.1, accuracy: 0.00001)
-        XCTAssertTrue(analyzed.allSatisfy { $0.decision?.speakerSlot == 0 })
-        for (index, frame) in (raw + analyzed).enumerated() {
-            XCTAssertEqual(frame.time, 5 + Double(index)/100, accuracy: 0.00001)
-        }
-        for frame in analyzed {
-            XCTAssertEqual(frame.decision?.start ?? -1, frame.time, accuracy: 0.00001)
-        }
+        let outputs = raw + next + (try await pipeline.finish())
+        let analysis = await pipeline.takeAnalysisUpdates()
+        XCTAssertEqual(Self.samples(outputs), [Float](repeating: 0.2, count: 14400))
+        XCTAssertTrue(outputs.allSatisfy { $0.decision == nil })
+        XCTAssertTrue(analysis.allSatisfy { $0.start >= 5.1-0.00001 })
+        XCTAssertTrue(analysis.contains { $0.speakerSlot == 0 })
     }
-    func testLateEnhancerDoesNotReprocessAnalysisBacklogBeforeActivation() async throws {
+    func testLateEnhancerNeverCausesAnalysisBacklogToHoldSTT() async throws {
         let pipeline = AudioPreprocessor(), enhancer = CountingEnhancer()
         await pipeline.setProviders(analysis: PatternAnalysis(delay: 100), enhancement: nil)
         let (early, _) = try await pipeline.process(Self.pcm(count: 4800, time: 2, amplitude: 0.2))
-        XCTAssertTrue(early.isEmpty)
+        XCTAssertFalse(early.isEmpty)
         await pipeline.installPrepared(analysis: nil, enhancement: enhancer)
         let (next, _) = try await pipeline.process(Self.pcm(count: 4800, time: 2.1, amplitude: 0.2))
         let outputs = early + next + (try await pipeline.finish())
         let counts = await enhancer.counts()
-        XCTAssertEqual(counts.process, 10) // Only the ten frames at/after 2.1.
-        XCTAssertEqual(counts.finish, 1)
+        XCTAssertEqual(counts.process, 0)
         XCTAssertEqual(Self.samples(outputs), [Float](repeating: 0.2, count: 9600))
-        for (index, frame) in outputs.enumerated() {
-            XCTAssertEqual(frame.time, 2 + Double(index)/100, accuracy: 0.00001)
-        }
     }
-    func testEnhancerReadyBeforeAnalysisStillUsesRawPathUntilAnalysisArrives() async throws {
+    func testEnhancerReadyBeforeAnalysisStillKeepsLivePathDryAndImmediate() async throws {
         let pipeline = AudioPreprocessor(), enhancer = CountingEnhancer()
         await pipeline.installPrepared(analysis: nil, enhancement: enhancer)
         let (raw, _) = try await pipeline.process(Self.pcm(count: 4800, time: 4, amplitude: 0.2))
@@ -691,10 +739,9 @@ final class CoreTests: XCTestCase {
         let (next, _) = try await pipeline.process(Self.pcm(count: 4800, time: 4.1, amplitude: 0.2))
         let outputs = raw + next + (try await pipeline.finish())
         let after = await enhancer.counts()
-        XCTAssertEqual(after.process, 10)
+        XCTAssertEqual(after.process, 0)
         XCTAssertEqual(Self.samples(outputs), [Float](repeating: 0.2, count: 9600))
-        XCTAssertTrue(raw.allSatisfy { $0.decision == nil })
-        XCTAssertEqual(outputs.last?.decision?.end ?? -1, 4.2, accuracy: 0.00001)
+        XCTAssertFalse((await pipeline.takeAnalysisUpdates()).isEmpty)
     }
     private static func confirmedSpeakerPair() -> SoftSpeakerMapper {
         var mapper = SoftSpeakerMapper()
