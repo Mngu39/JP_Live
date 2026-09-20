@@ -1,6 +1,8 @@
 import Foundation
 
-// Keeps phrase/chunk state separate from UI geometry and the asynchronous recognizer.
+// Keeps rolling recognizer state separate from UI geometry and the asynchronous recognizer.
+// SpeechTranscriber final fragments are NOT treated as sentence boundaries. They accumulate
+// until NaturalLanguage identifies a completed sentence; only long silence/duration are fallbacks.
 struct TranscriptBuffer {
     var rows: [Caption] = []
     private var captureID = UUID()
@@ -11,7 +13,6 @@ struct TranscriptBuffer {
     private var pendingStart: Double = 0
     private var pendingEnd: Double = 0
     private var pendingSpeaker: Int?
-    private var pendingUpdatedAt: Double = 0
     private var lastResultAt: Double = 0
     private var volatileUpdatedAt: Double = 0
     private var volatile = ""
@@ -25,7 +26,7 @@ struct TranscriptBuffer {
     }
 
     // UI clear is intentionally independent from capture lifetime. The recognizer keeps
-    // running; subsequent results start a fresh visible chunk in the same capture.
+    // running; subsequent results start a fresh visible sentence in the same capture.
     mutating func clearDisplay() {
         rows.removeAll(keepingCapacity: true)
         resetChunkState()
@@ -35,7 +36,7 @@ struct TranscriptBuffer {
         draftID = nil; pending = ""; volatile = ""
         pendingStart = 0; pendingEnd = 0; volatileStart = 0; volatileEnd = 0
         pendingSpeaker = nil; volatileSpeaker = nil
-        pendingUpdatedAt = 0; lastResultAt = 0; volatileUpdatedAt = 0
+        lastResultAt = 0; volatileUpdatedAt = 0
     }
 
     mutating func receive(_ text: String, final: Bool, start: Double, end: Double,
@@ -43,10 +44,8 @@ struct TranscriptBuffer {
         guard start.isFinite, end.isFinite, end >= start, now.isFinite else { return [] }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
-            // An empty result can revoke the current tentative phrase, including when
-            // the recognizer finalizes that phrase as containing no speech. Never
-            // erase a finalized prefix or an unrelated interval's tentative text.
-            let sameStart = start == volatileStart
+            // Empty volatile/final results may revoke the current tentative hypothesis.
+            let sameStart = abs(start-volatileStart) < 1.0/24000
             let overlaps = start < volatileEnd && end > volatileStart
             if !volatile.isEmpty && (sameStart || overlaps) {
                 volatile = ""; volatileSpeaker = nil; lastResultAt = now
@@ -55,98 +54,90 @@ struct TranscriptBuffer {
             return []
         }
 
-        // SpeechTranscriber can occasionally emit punctuation-only results for noise or
-        // a revoked hypothesis. Never create a standalone caption such as ".". A final
-        // punctuation-only result may decorate an already-open semantic prefix.
-        if ChunkBoundary.isPunctuationOnly(trimmed) {
+        // Punctuation-only noise must never become its own row. A final sentence mark may
+        // decorate the stable rolling prefix and can then let NLTokenizer close it.
+        if SentenceBoundary.isPunctuationOnly(trimmed) {
             lastResultAt = now
-            if final, !pending.isEmpty, trimmed.contains(where: { "。！？.!?…".contains($0) }) {
-                if let last = trimmed.last, pending.last != last { pending.append(last) }
-                pendingEnd = max(pendingEnd, end); pendingUpdatedAt = now
-                refreshDraft()
-            }
-            return []
+            guard final, !pending.isEmpty, trimmed.contains(where: { "。！？.!?…".contains($0) }) else { return [] }
+            if let last = trimmed.last, pending.last != last { pending.append(last) }
+            pendingEnd = max(pendingEnd, end)
+            let ready = commitCompletedSentences()
+            if !pending.isEmpty || !volatile.isEmpty { refreshDraft() }
+            return ready
         }
 
         lastResultAt = now
-        var ready: [UUID] = []
         if final {
-            volatile = ""
-            let pause = pending.isEmpty ? 0 : max(0, start-pendingEnd)
-            // A raw slot flip is not enough. Require a sustained new final phrase so a
-            // short diarization wobble cannot fragment a broadcast into tiny rows.
-            let sustainedSpeakerChange = pendingSpeaker != nil && speaker != nil && pendingSpeaker != speaker
-                && start >= pendingEnd-0.02 && end-start >= 0.30
-            let punctuationGrace = start >= pendingEnd-0.02 && ChunkBoundary.hasStrongEnding(pending)
-                && now-pendingUpdatedAt >= ChunkBoundary.strongPause
-            if !pending.isEmpty && (sustainedSpeakerChange || punctuationGrace || ChunkBoundary.shouldCommit(pending, pause: pause,
-                duration: pendingEnd-pendingStart, language: language)) { ready += commit() }
-            if pending.isEmpty { pendingStart = start; pendingSpeaker = speaker }
-            else if pendingSpeaker != speaker, speaker != nil { pendingSpeaker = nil }
-            pending = join(pending, text); pendingEnd = end; pendingUpdatedAt = now
-            // Punctuation alone no longer seals a row. Hard duration/length caps still do.
-            if ChunkBoundary.shouldCommit(pending, pause: 0, duration: end-pendingStart, language: language) {
-                ready += commit()
-            } else { refreshDraft() }
-        } else {
-            // If a new tentative phrase begins after a credible boundary, settle the
-            // stable prefix first; otherwise keep it live as one growing broadcast row.
-            let pause = pending.isEmpty ? 0 : max(0, start-pendingEnd)
-            let punctuationGrace = start >= pendingEnd-0.02 && ChunkBoundary.hasStrongEnding(pending)
-                && now-pendingUpdatedAt >= ChunkBoundary.strongPause
-            if !pending.isEmpty && start >= pendingEnd-0.02 && (punctuationGrace || ChunkBoundary.shouldCommit(pending, pause: pause,
-                duration: pendingEnd-pendingStart, language: language)) {
-                ready += commit()
+            // Final replaces the tentative hypothesis for that recognizer phrase, but does
+            // not itself mean "sentence complete".
+            let sameStart = abs(start-volatileStart) < 1.0/24000
+            let overlaps = start < volatileEnd && end > volatileStart
+            if !volatile.isEmpty && (sameStart || overlaps) {
+                volatile = ""; volatileSpeaker = nil
             }
-            volatile = text; volatileStart = start; volatileEnd = end; volatileSpeaker = speaker; volatileUpdatedAt = now
-            refreshDraft()
+            if pending.isEmpty {
+                pendingStart = start; pendingSpeaker = speaker
+            } else if pendingSpeaker != speaker, speaker != nil {
+                // Mixed/uncertain speaker attribution does not split a sentence.
+                pendingSpeaker = nil
+            }
+            pending = join(pending, trimmed)
+            pendingEnd = max(pendingEnd, end)
+            let ready = commitCompletedSentences()
+            if !pending.isEmpty || !volatile.isEmpty { refreshDraft() }
+            return ready
         }
-        return ready
+
+        volatile = trimmed; volatileStart = start; volatileEnd = end
+        volatileSpeaker = speaker; volatileUpdatedAt = now
+        refreshDraft()
+        return []
     }
 
     mutating func tick(now: Double, activity: AudioActivity? = nil) -> [UUID] {
         guard !pending.isEmpty, now.isFinite else { return [] }
-        // Maximum length/duration is a deliberate latency cap, not detected silence.
+
+        // Normal sentence detection is text-based. These are only escape hatches for
+        // punctuation-free speech or recognizer behavior that never yields an internal boundary.
         let span = max(pendingEnd, volatile.isEmpty ? pendingEnd : volatileEnd)-pendingStart
-        if span >= ChunkBoundary.hardDuration || pending.utf16.count >= (language == .japanese ? 110 : 240) { return commit() }
-        let matched = activity.flatMap { $0.through >= pendingEnd ? $0 : nil }
-        let punctuationGrace = volatile.isEmpty && ChunkBoundary.hasStrongEnding(pending)
-            && now-pendingUpdatedAt >= ChunkBoundary.strongPause
-        if matched?.speaking == true && !punctuationGrace { return [] }
+        if span >= SentenceBoundary.fallbackDuration ||
+            pending.utf16.count >= SentenceBoundary.fallbackCharacterLimit(language) {
+            return commitAllPending()
+        }
+
         guard now-lastResultAt >= 0.20 else { return [] }
+        let matched = activity.flatMap { $0.through >= pendingEnd ? $0 : nil }
+        if matched?.speaking == true { return [] }
 
         if !volatile.isEmpty {
-            // A changing continuation is not a pause. If both recognizer and VAD have
-            // gone quiet, only the stable prefix may settle; the tentative tail remains.
-            guard now-volatileUpdatedAt >= ChunkBoundary.ordinaryPause, let matched, !matched.speaking,
-                  matched.through >= volatileEnd, matched.silence >= ChunkBoundary.ordinaryPause else { return [] }
-            return ChunkBoundary.shouldCommit(pending, pause: matched.silence,
-                duration: pendingEnd-pendingStart, language: language) ? commit() : []
+            guard now-volatileUpdatedAt >= SentenceBoundary.fallbackSilence,
+                  let matched, !matched.speaking,
+                  matched.through >= volatileEnd,
+                  matched.silence >= SentenceBoundary.fallbackSilence else { return [] }
+            return commitAllPending()
         }
 
-        if punctuationGrace { return commit() }
-        if let matched {
-            return ChunkBoundary.shouldCommit(pending, pause: matched.silence,
-                duration: pendingEnd-pendingStart, language: language) ? commit() : []
+        if let matched, !matched.speaking, matched.silence >= SentenceBoundary.fallbackSilence {
+            return commitAllPending()
         }
-        // No VAD evidence yet: recognizer-idle acts only as a bounded fallback and uses
-        // the same adaptive thresholds, so punctuation settles quickly but a breath does not.
-        let idle = now-lastResultAt
-        return ChunkBoundary.shouldCommit(pending, pause: idle,
-            duration: pendingEnd-pendingStart, language: language) ? commit() : []
+        if matched == nil && now-lastResultAt >= SentenceBoundary.fallbackRecognizerIdle {
+            return commitAllPending()
+        }
+        return []
     }
 
     mutating func finish() -> [UUID] {
-        let ready = commit()
-        if let id = draftID, let index = rows.firstIndex(where: { $0.id == id }) {
+        let ready = commitAllPending()
+        if !volatile.isEmpty { refreshDraft() }
+        if let id = draftID, let index = rows.firstIndex(where: { $0.id == id && !$0.isFinal }) {
             rows[index].translationError = "인식 종료 · 미확정 원문"
         }
-        draftID = nil; volatile = ""
+        volatile = ""; volatileSpeaker = nil
         return ready
     }
 
-    // Diarization is allowed to arrive after STT. Fill/refresh speaker metadata by the
-    // source-audio interval without holding recognition audio for the classifier.
+    // Diarization is allowed to arrive after STT. It annotates already-visible text and
+    // never determines a sentence boundary.
     mutating func applySpeakerTimeline(_ timeline: SpeechTimeline) -> [UUID] {
         var changed: [UUID] = []
         if !pending.isEmpty, timeline.decision(start: pendingStart, end: pendingEnd) != nil {
@@ -163,6 +154,48 @@ struct TranscriptBuffer {
         }
         if draftID != nil { refreshDraft() }
         return changed
+    }
+
+    // A delayed, quality-pass SpeechTranscriber produces its own sentence rows. Match by
+    // source-audio time and update/merge the already-visible row in place. This preserves
+    // low-latency display while letting the better second pass correct it later.
+    mutating func applyRevision(_ revised: Caption) -> TranscriptRevisionEffect? {
+        guard revised.isFinal, revised.captureID == captureID, revised.language == language,
+              revised.end > revised.start, SentenceBoundary.hasSemanticContent(revised.source) else { return nil }
+        let candidates = rows.indices.filter { index in
+            let row = rows[index]
+            guard row.isFinal, row.captureID == captureID, row.language == language else { return false }
+            return min(row.end, revised.end) - max(row.start, revised.start) > 0.02
+        }
+        guard let first = candidates.first, let last = candidates.last else { return nil }
+        let overlap = candidates.reduce(0.0) { value, index in
+            value + max(0, min(rows[index].end, revised.end)-max(rows[index].start, revised.start))
+        }
+        let revisedDuration = max(0.001, revised.end-revised.start)
+        let existingStart = rows[first].start
+        let existingEnd = rows[last].end
+        let existingDuration = max(0.001, existingEnd-existingStart)
+        guard overlap / min(revisedDuration, existingDuration) >= 0.55 else { return nil }
+
+        let existingSource = candidates.map { rows[$0].source }.reduce("") { join($0, $1) }
+        guard existingSource != revised.source || candidates.count > 1 else { return nil }
+
+        let keptID = rows[first].id
+        let removed = candidates.dropFirst().map { rows[$0].id }
+        let old = rows[first]
+        let sameSpeaker = candidates.allSatisfy { rows[$0].speaker == old.speaker }
+        var replacement = Caption(
+            id: keptID, captureID: captureID, language: language,
+            source: revised.source, translation: "", tokens: [],
+            start: min(existingStart, revised.start), end: max(existingEnd, revised.end),
+            isFinal: true, revision: old.revision + 1,
+            speaker: revised.speaker ?? (sameSpeaker ? old.speaker : nil),
+            gutterHint: old.gutterHint
+        )
+        replacement.translationError = nil
+        for index in candidates.reversed() { rows.remove(at: index) }
+        rows.insert(replacement, at: first)
+        return TranscriptRevisionEffect(updatedID: keptID, removedIDs: removed)
     }
 
     private func join(_ first: String, _ second: String) -> String {
@@ -187,8 +220,6 @@ struct TranscriptBuffer {
             end: volatile.isEmpty ? pendingEnd : volatileEnd, isFinal: false,
             speaker: pending.isEmpty ? volatileSpeaker : (volatile.isEmpty || volatileSpeaker == pendingSpeaker ? pendingSpeaker : nil))
         row.revision = old.map { $0.revision + 1 } ?? 0
-        // Keep the last translation on screen while the latest-wins request is in flight.
-        // It is replaced atomically when translation for the new source returns.
         if let old {
             row.translation = old.translation
             row.translationError = old.translationError
@@ -198,30 +229,62 @@ struct TranscriptBuffer {
         if let previous { rows[previous] = row } else { rows.append(row) }
     }
 
-    private mutating func commit() -> [UUID] {
-        guard !pending.isEmpty, ChunkBoundary.hasSemanticContent(pending) else { return [] }
-        let existingID = draftID
-        let oldDraft = rows.first(where: { $0.id == existingID })
-        let oldRevision = oldDraft?.revision ?? 0
-        if let existingID { rows.removeAll { $0.id == existingID } }
-        draftID = nil
+    private mutating func commitCompletedSentences() -> [UUID] {
         var ready: [UUID] = []
-        for (index, piece) in ChunkBoundary.split(pending, limit: language == .japanese ? 110 : 240).enumerated() {
-            guard ChunkBoundary.hasSemanticContent(piece) else { continue }
-            let id = index == 0 ? existingID ?? UUID() : UUID()
-            var row = Caption(id: id, captureID: captureID, language: language, source: piece,
-                tokens: [], start: pendingStart,
-                end: pendingEnd, isFinal: true, revision: oldRevision+1, speaker: pendingSpeaker)
-            if index == 0, let oldDraft {
-                row.translation = oldDraft.translation
-                row.translationError = nil
-                row.gutterHint = oldDraft.gutterHint
-                if oldDraft.source == piece { row.tokens = oldDraft.tokens }
-            }
-            rows.append(row); ready.append(id)
+        while let length = SentenceBoundary.firstCompletedSentencePrefixUTF16Length(in: pending, language: language),
+              length > 0, length <= pending.utf16.count {
+            ready += commitPrefix(length)
+            if pending.isEmpty { break }
         }
-        pending = ""; pendingSpeaker = nil
-        if !volatile.isEmpty { refreshDraft() }
         return ready
+    }
+
+    private mutating func commitAllPending() -> [UUID] {
+        guard !pending.isEmpty else { return [] }
+        return commitPrefix(pending.utf16.count)
+    }
+
+    private mutating func commitPrefix(_ utf16Count: Int) -> [UUID] {
+        guard utf16Count > 0, utf16Count <= pending.utf16.count else { return [] }
+        let original = pending
+        let total = max(1, original.utf16.count)
+        let ns = original as NSString
+        let piece = ns.substring(to: utf16Count).trimmingCharacters(in: .whitespacesAndNewlines)
+        let remainder = ns.substring(from: utf16Count).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard SentenceBoundary.hasSemanticContent(piece) else {
+            pending = remainder
+            return []
+        }
+
+        let ratio = min(1, max(0, Double(utf16Count) / Double(total)))
+        let commitEnd = utf16Count == total ? pendingEnd : pendingStart + (pendingEnd-pendingStart)*ratio
+        let existingID = draftID
+        let oldDraft = rows.first(where: { $0.id == existingID && !$0.isFinal })
+        let id = existingID ?? UUID()
+        if let existingID { rows.removeAll { $0.id == existingID && !$0.isFinal } }
+        draftID = nil
+
+        var row = Caption(id: id, captureID: captureID, language: language, source: piece,
+            tokens: [], start: pendingStart, end: commitEnd, isFinal: true,
+            revision: (oldDraft?.revision ?? 0)+1, speaker: pendingSpeaker)
+        if let oldDraft {
+            row.gutterHint = oldDraft.gutterHint
+            // A draft translation for a longer rolling sentence is not valid for a prefix.
+            if oldDraft.source == piece {
+                row.translation = oldDraft.translation
+                row.tokens = oldDraft.tokens
+            }
+        }
+        rows.append(row)
+
+        pending = remainder
+        if pending.isEmpty {
+            pendingStart = 0; pendingEnd = 0; pendingSpeaker = nil
+        } else {
+            pendingStart = commitEnd
+            // The original speaker attribution remains valid only if it was unambiguous.
+        }
+        if !pending.isEmpty || !volatile.isEmpty { refreshDraft() }
+        return [id]
     }
 }

@@ -59,7 +59,7 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
-    func testDeviceValidationScreenshotProbePassesContinuousAudioAcrossReconfigurationWindow() {
+    func testDeviceValidationScreenshotProbePassesContinuousAudioAcrossSameStreamScreenOutputWindow() {
         let metrics = DeviceValidationMetricStore(startedAt: Date(timeIntervalSince1970: 0), startedUptime: 10, requireScreenshotProbe: true)
         metrics.markSTTPrepared(); metrics.markCaptureRequested(observedAt: 10)
         let raw = DeviceValidationAudioFormat(sampleRate: 48000, channels: 2, sampleFormat: "float32", interleaved: false)
@@ -75,9 +75,6 @@ final class CoreTests: XCTestCase {
         metrics.recordSpeechAppend(frames: 240000)
         metrics.recordAnalyzerInput(buffer: firstAnalyzer, startTime: .zero)
         metrics.markScreenshotProbeStarted(observedAt: 15)
-        metrics.markLowResolutionSecondStreamProbeStarted(observedAt: 15.1)
-        metrics.markLowResolutionSecondStreamProbeFinished(observedAt: 15.2)
-        metrics.markHighResolutionScreenshotAttemptStarted()
         metrics.markScreenshotProbeFinished(metadata: ["mime":"image/webp", "width":1600, "height":900, "size_bytes":12345], observedAt: 15.8)
 
         metrics.recordRaw(time: 5, frames: 288000, format: raw, observedAt: 16)
@@ -95,14 +92,11 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(report.screenshotContinuity.analyzerWindowCompleted)
         XCTAssertEqual(report.screenshotContinuity.rawGapCount, 0)
         XCTAssertEqual(report.screenshotContinuity.rawOverlapCount, 0)
-        XCTAssertTrue(report.screenshotContinuity.lowResolutionSecondStream.attempted)
-        XCTAssertTrue(report.screenshotContinuity.lowResolutionSecondStream.started)
-        XCTAssertTrue(report.screenshotContinuity.highResolutionCaptureAttempted)
         XCTAssertTrue(report.checks.contains { $0.name == "screenshot_audio_continuity" && $0.verdict == .pass })
     }
 
     @MainActor
-    func testDeviceValidationScreenshotProbeFailsWhenGapAppearsAfterReconfigurationStarts() {
+    func testDeviceValidationScreenshotProbeFailsWhenGapAppearsAfterSameStreamScreenOutputStarts() {
         let metrics = DeviceValidationMetricStore(startedAt: Date(timeIntervalSince1970: 0), startedUptime: 10, requireScreenshotProbe: true)
         metrics.markSTTPrepared(); metrics.markCaptureRequested(observedAt: 10)
         let raw = DeviceValidationAudioFormat(sampleRate: 48000, channels: 2, sampleFormat: "float32", interleaved: false)
@@ -118,9 +112,6 @@ final class CoreTests: XCTestCase {
         metrics.recordSpeechAppend(frames: 240000)
         metrics.recordAnalyzerInput(buffer: firstAnalyzer, startTime: .zero)
         metrics.markScreenshotProbeStarted(observedAt: 15)
-        metrics.markLowResolutionSecondStreamProbeStarted(observedAt: 15.1)
-        metrics.markLowResolutionSecondStreamProbeFinished(observedAt: 15.2)
-        metrics.markHighResolutionScreenshotAttemptStarted()
         metrics.markScreenshotProbeFinished(metadata: ["mime":"image/webp", "width":1600, "height":900, "size_bytes":12345], observedAt: 15.8)
 
         metrics.recordRaw(time: 5.1, frames: 288000, format: raw, observedAt: 16)
@@ -137,19 +128,17 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
-    func testDeviceValidationSecondStreamStartFailurePreservesNSErrorDetail() {
+    func testDeviceValidationScreenshotFailurePreservesNSErrorDetail() {
         let metrics = DeviceValidationMetricStore(
             startedAt: Date(timeIntervalSince1970: 0),
             startedUptime: 10,
             requireScreenshotProbe: true)
         metrics.markScreenshotProbeStarted(observedAt: 15)
-        metrics.markLowResolutionSecondStreamProbeStarted(observedAt: 15.01)
         let error = NSError(
             domain: "SCStreamErrorDomain",
             code: -3802,
-            userInfo: [NSLocalizedDescriptionKey: "Stream failed to start", "probe": "low-res-16x16"])
-        metrics.markLowResolutionSecondStreamProbeFailed(error, observedAt: 15.04)
-        metrics.markScreenshotProbeFailed(error, highResolutionAttempted: false, observedAt: 15.04)
+            userInfo: [NSLocalizedDescriptionKey: "Screen output failed", "probe": "same-stream-screen-output"])
+        metrics.markScreenshotProbeFailed(error, observedAt: 15.04)
 
         let report = metrics.finish(
             userStopped: true,
@@ -157,14 +146,11 @@ final class CoreTests: XCTestCase {
             endedUptime: 16)
         let screenshot = report.screenshotContinuity
         XCTAssertEqual(screenshot.verdict, .fail)
-        XCTAssertTrue(screenshot.lowResolutionSecondStream.attempted)
-        XCTAssertFalse(screenshot.lowResolutionSecondStream.started)
-        XCTAssertFalse(screenshot.highResolutionCaptureAttempted)
-        XCTAssertEqual(screenshot.lowResolutionSecondStream.error?.domain, "SCStreamErrorDomain")
-        XCTAssertEqual(screenshot.lowResolutionSecondStream.error?.code, -3802)
-        XCTAssertEqual(screenshot.lowResolutionSecondStream.error?.userInfo["probe"], "low-res-16x16")
+        XCTAssertTrue(screenshot.attempted)
+        XCTAssertFalse(screenshot.succeeded)
         XCTAssertEqual(screenshot.errorDetail?.domain, "SCStreamErrorDomain")
         XCTAssertEqual(screenshot.errorDetail?.code, -3802)
+        XCTAssertEqual(screenshot.errorDetail?.userInfo["probe"], "same-stream-screen-output")
     }
 
     @MainActor
@@ -228,14 +214,11 @@ final class CoreTests: XCTestCase {
         let b = Caption(captureID: UUID(), language: .japanese, source: "ありがとう", start: 0, end: 1, isFinal: true)
         XCTAssertNotEqual(a.contextGroup, b.contextGroup)
     }
-    func testContinuationBoundaryAndLosslessSplit() {
-        XCTAssertFalse(ChunkBoundary.shouldCommit("そうだけど", pause: 0.7, duration: 3, language: .japanese))
-        XCTAssertFalse(ChunkBoundary.shouldCommit("そうです。", pause: 0, duration: 1, language: .japanese))
-        XCTAssertTrue(ChunkBoundary.shouldCommit("そうです。", pause: 0.3, duration: 1, language: .japanese))
-        XCTAssertFalse(ChunkBoundary.shouldCommit("息を吸って続ける", pause: 0.5, duration: 3, language: .japanese))
-        XCTAssertTrue(ChunkBoundary.shouldCommit("ここで区切る", pause: 0.8, duration: 3, language: .japanese))
-        let long = String(repeating: "これはテストです。", count: 30)
-        XCTAssertEqual(ChunkBoundary.split(long, limit: 110).joined(), long)
+    func testNaturalLanguageSentenceBoundaryDoesNotUseShortPauseRules() {
+        XCTAssertNil(SentenceBoundary.firstCompletedSentencePrefixUTF16Length(in: "そうだけど", language: .japanese))
+        XCTAssertNotNil(SentenceBoundary.firstCompletedSentencePrefixUTF16Length(in: "そうです。", language: .japanese))
+        XCTAssertEqual(SentenceBoundary.fallbackSilence, 2.0)
+        XCTAssertEqual(SentenceBoundary.fallbackDuration, 20.0)
     }
     func testNoSpeechNoBoostAndFiniteCeiling() {
         var leveler = SpeechLeveler()
@@ -262,8 +245,7 @@ final class CoreTests: XCTestCase {
         buffer.begin(captureID: UUID(), language: .japanese)
         XCTAssertTrue(buffer.receive("今日は", final: false, start: 0, end: 1, speaker: nil, now: 0).isEmpty)
         let draftID = buffer.rows[0].id
-        XCTAssertTrue(buffer.receive("今日は晴れです。", final: true, start: 0, end: 2, speaker: nil, now: 1).isEmpty)
-        let ready = buffer.tick(now: 1.31)
+        let ready = buffer.receive("今日は晴れです。", final: true, start: 0, end: 2, speaker: nil, now: 1)
         XCTAssertEqual(ready, [draftID])
         XCTAssertEqual(buffer.rows.count, 1)
         XCTAssertEqual(buffer.rows[0].id, draftID)
@@ -277,7 +259,7 @@ final class CoreTests: XCTestCase {
         let firstID = buffer.rows[0].id
         _ = buffer.receive("ゲーム", final: false, start: 1, end: 2, speaker: nil, now: 0.5)
         XCTAssertTrue(buffer.tick(now: 1.3).isEmpty)
-        XCTAssertEqual(buffer.tick(now: 2, activity: AudioActivity(through: 3.3, speaking: false, silence: 1.3)), [firstID])
+        XCTAssertEqual(buffer.tick(now: 2.6, activity: AudioActivity(through: 3.6, speaking: false, silence: 2.6)), [firstID])
         XCTAssertEqual(buffer.rows.map(\.source), ["昨日", "ゲーム"])
         let tailID = buffer.rows[1].id
         _ = buffer.receive("ゲームをした。", final: true, start: 1, end: 3, speaker: nil, now: 3)
@@ -396,9 +378,10 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(buffer.receive(".", final: true, start: 0, end: 0.1, speaker: nil, now: 0).isEmpty)
         XCTAssertTrue(buffer.rows.isEmpty)
         _ = buffer.receive("今日は", final: true, start: 0.2, end: 1, speaker: nil, now: 0.2)
-        XCTAssertTrue(buffer.receive("。", final: true, start: 1, end: 1.01, speaker: nil, now: 0.3).isEmpty)
+        let ready = buffer.receive("。", final: true, start: 1, end: 1.01, speaker: nil, now: 0.3)
         XCTAssertEqual(buffer.rows.map(\.source), ["今日は。"] )
-        XCTAssertEqual(buffer.tick(now: 0.61).count, 1)
+        XCTAssertEqual(ready.count, 1)
+        XCTAssertTrue(buffer.rows[0].isFinal)
     }
 
     func testRevocationPreservesFinalPrefixIdentityAndTiming() {
@@ -417,7 +400,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(buffer.rows[0].start, 0)
         XCTAssertEqual(buffer.rows[0].end, 1)
         XCTAssertEqual(buffer.rows[0].speaker, 0)
-        XCTAssertEqual(buffer.tick(now: 2.3), [id])
+        XCTAssertEqual(buffer.tick(now: 3.6), [id])
         XCTAssertTrue(buffer.rows[0].isFinal)
     }
     func testRevocationDoesNotRemoveCommittedHistory() {
@@ -452,8 +435,7 @@ final class CoreTests: XCTestCase {
         _ = buffer.receive("noise", final: false, start: 0, end: 1, speaker: nil, now: 0)
         let discardedGroup = buffer.rows[0].contextGroup
         _ = buffer.receive("", final: false, start: 0, end: 1.1, speaker: nil, now: 1)
-        XCTAssertTrue(buffer.receive("Hello.", final: true, start: 2, end: 3, speaker: nil, now: 2).isEmpty)
-        let ready = buffer.tick(now: 2.31)
+        let ready = buffer.receive("Hello.", final: true, start: 2, end: 3, speaker: nil, now: 2)
         XCTAssertEqual(buffer.rows.count, 1)
         XCTAssertEqual(ready, [buffer.rows[0].id])
         XCTAssertEqual(buffer.rows[0].source, "Hello.")
@@ -531,41 +513,50 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(buffer.tick(now: 5, activity: AudioActivity(through: 5, speaking: true, silence: 0)).isEmpty)
         XCTAssertFalse(buffer.rows[0].isFinal)
     }
-    func testDetectedSilenceRespectsJapaneseContinuationEnding() {
+    func testShortBreathNeverCommitsButLongSilenceFallbackDoes() {
         var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
         _ = buffer.receive("そうだけど", final: true, start: 0, end: 1, speaker: nil, now: 0)
-        XCTAssertTrue(buffer.tick(now: 2, activity: AudioActivity(through: 1.7, speaking: false, silence: 0.7)).isEmpty)
-        XCTAssertEqual(buffer.tick(now: 2.5, activity: AudioActivity(through: 2.3, speaking: false, silence: 1.3)).count, 1)
+        XCTAssertTrue(buffer.tick(now: 1.5, activity: AudioActivity(through: 1.7, speaking: false, silence: 0.7)).isEmpty)
+        XCTAssertEqual(buffer.tick(now: 2.5, activity: AudioActivity(through: 3.2, speaking: false, silence: 2.2)).count, 1)
     }
-    func testMaxDurationCommitsOnlyFinalPrefixAndKeepsVolatileTail() {
+    func testLongDurationFallbackCommitsOnlyStablePrefixAndKeepsVolatileTail() {
         var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
         _ = buffer.receive("前半", final: true, start: 0, end: 1, speaker: nil, now: 0)
-        _ = buffer.receive("続く話", final: false, start: 1, end: 10, speaker: nil, now: 10)
-        XCTAssertEqual(buffer.tick(now: 10, activity: AudioActivity(through: 10, speaking: true, silence: 0)).count, 1)
+        _ = buffer.receive("続く話", final: false, start: 1, end: 21, speaker: nil, now: 21)
+        XCTAssertEqual(buffer.tick(now: 21, activity: AudioActivity(through: 21, speaking: true, silence: 0)).count, 1)
         XCTAssertEqual(buffer.rows.map(\.source), ["前半", "続く話"])
         XCTAssertTrue(buffer.rows[0].isFinal)
         XCTAssertFalse(buffer.rows[1].isFinal)
     }
-    func testKnownSpeakerChangeSeparatesFinalPhrasesButUnknownDoesNot() {
-        let speakers: [Int?] = [0, nil]
-        for first in speakers {
-            var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
-            _ = buffer.receive("昨日", final: true, start: 0, end: 1, speaker: first, now: 0)
-            let ready = buffer.receive("ゲーム", final: true, start: 1, end: 2, speaker: 1, now: 0.1)
-            XCTAssertEqual(ready.count, first == nil ? 0 : 1)
-            XCTAssertEqual(buffer.rows.count, first == nil ? 1 : 2)
-        }
-    }
-    func testShortSpeakerJitterDoesNotSplitButSustainedTurnCan() {
+    func testSpeakerChangeDoesNotDefineSentenceBoundary() {
         var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
         _ = buffer.receive("昨日", final: true, start: 0, end: 1, speaker: 0, now: 0)
-        XCTAssertTrue(buffer.receive("あ", final: true, start: 1, end: 1.15, speaker: 1, now: 0.1).isEmpty)
+        XCTAssertTrue(buffer.receive("ゲーム", final: true, start: 1, end: 2, speaker: 1, now: 0.1).isEmpty)
         XCTAssertEqual(buffer.rows.count, 1)
-
-        var sustained = TranscriptBuffer(); sustained.begin(captureID: UUID(), language: .japanese)
-        _ = sustained.receive("昨日", final: true, start: 0, end: 1, speaker: 0, now: 0)
-        XCTAssertEqual(sustained.receive("ゲーム", final: true, start: 1, end: 1.4, speaker: 1, now: 0.1).count, 1)
-        XCTAssertEqual(sustained.rows.count, 2)
+        XCTAssertFalse(buffer.rows[0].isFinal)
+        XCTAssertEqual(buffer.rows[0].source, "昨日ゲーム")
+    }
+    func testSustainedSpeakerTurnStillDoesNotOverrideSentenceTokenizer() {
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
+        _ = buffer.receive("昨日", final: true, start: 0, end: 1, speaker: 0, now: 0)
+        XCTAssertTrue(buffer.receive("ゲーム", final: true, start: 1, end: 1.4, speaker: 1, now: 0.1).isEmpty)
+        XCTAssertEqual(buffer.rows.count, 1)
+        XCTAssertFalse(buffer.rows[0].isFinal)
+    }
+    func testQualityRevisionUpdatesSameCaptionAndCanMergeOversplitRows() {
+        let capture = UUID()
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: capture, language: .japanese)
+        _ = buffer.receive("これはテストです。", final: true, start: 0, end: 1, speaker: nil, now: 0)
+        _ = buffer.receive("次です。", final: true, start: 1, end: 2, speaker: nil, now: 1)
+        XCTAssertEqual(buffer.rows.count, 2)
+        let kept = buffer.rows[0].id
+        let revised = Caption(captureID: capture, language: .japanese,
+            source: "これはテストです。次です。", start: 0, end: 2, isFinal: true)
+        let effect = buffer.applyRevision(revised)
+        XCTAssertEqual(effect?.updatedID, kept)
+        XCTAssertEqual(buffer.rows.count, 1)
+        XCTAssertEqual(buffer.rows[0].source, revised.source)
+        XCTAssertEqual(buffer.rows[0].id, kept)
     }
 
     func testLateSpeakerTimelineUpdatesVisibleCaptionWithoutHoldingSTT() {

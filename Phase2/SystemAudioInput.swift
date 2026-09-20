@@ -20,10 +20,6 @@ final class SystemAudioInput: NSObject, AudioInput {
         throw AppFailure.message("iOS Simulator에서는 화면 캡처를 사용할 수 없습니다.")
     }
 
-    func deviceValidationProbeSecondScreenStreamStart() async throws {
-        throw AppFailure.message("iOS Simulator에서는 두 번째 화면 스트림을 검증할 수 없습니다.")
-    }
-
     func start() async throws -> AsyncThrowingStream<PCMChunk, Error> {
         throw AppFailure.message("iOS Simulator에서는 시스템 오디오 캡처를 사용할 수 없습니다.")
     }
@@ -48,91 +44,73 @@ final class SystemAudioInput: NSObject, AudioInput {
     }
 
     func captureLearningScreenshot() async throws -> [String: Any] {
-        guard active, let contentFilter else {
+        guard active, let stream, let target = screenshotTarget else {
             throw AppFailure.message("시스템 화면 캡처가 실행 중일 때만 스크린샷을 저장할 수 있습니다.")
         }
-        guard screenshotStream == nil else {
+        guard screenshotOutput == nil else {
             throw AppFailure.message("이미 저장용 스크린샷을 캡처하고 있습니다.")
         }
 
-        // Reuse the filter that the person already approved in the system picker,
-        // but capture the still frame with a second, short-lived screen-only stream.
-        // The long-running 48 kHz audio stream and its 16×16 screen output are never
-        // reconfigured or stopped for the screenshot path.
+        // Keep one long-running SCStream. Normal operation attaches only the audio
+        // output. When the user explicitly saves an item, temporarily attach one
+        // .screen output to this same stream, receive one frame, and remove it again.
+        // No picker re-presentation and no continuous screen-sample delivery while
+        // the screenshot output is detached.
         let requestID = selectionID
-        let target = try Self.screenshotTarget(for: contentFilter, maxEdge: 1600)
-        let config = Self.screenshotConfiguration(width: target.width, height: target.height)
         let output = ScreenFrameOutput()
         let ticket = output.armScreenshot(minWidth: target.width, minHeight: target.height)
-        let stream = SCStream(filter: contentFilter, configuration: config, delegate: nil)
-        screenshotStream = stream
         screenshotOutput = output
+        var screenOutputAttached = false
 
         do {
             try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: output.queue)
-            try await stream.startCapture()
+            screenOutputAttached = true
             let image = try await ticket.value()
-            guard active, selectionID == requestID, self.screenshotStream === stream else {
+
+            guard active, selectionID == requestID,
+                  self.stream === stream, self.screenshotOutput === output else {
                 throw AppFailure.message("화면 공유 대상이 바뀌어 스크린샷을 취소했습니다.")
             }
-            try? await stream.stopCapture()
-            if self.screenshotStream === stream {
-                screenshotStream = nil
-                screenshotOutput = nil
+
+            do {
+                try stream.removeStreamOutput(output, type: .screen)
+                screenOutputAttached = false
+            } catch {
+                // Never leave high-resolution screen delivery attached after a save.
+                // If removal itself fails, stop the capture rather than silently
+                // continuing to receive screen frames.
+                output.cancelScreenshot(ticket, error: error)
+                try? await stream.stopCapture()
+                if self.stream === stream {
+                    self.stream = nil
+                    self.contentFilter = nil
+                    self.screenshotTarget = nil
+                    self.screenshotOutput = nil
+                    continuation?.finish(throwing: error)
+                }
+                throw error
             }
+
+            if self.screenshotOutput === output { self.screenshotOutput = nil }
             return try Self.encodeScreenshot(image, target: target)
         } catch {
             output.cancelScreenshot(ticket, error: error)
-            try? await stream.stopCapture()
-            if self.screenshotStream === stream {
-                screenshotStream = nil
-                screenshotOutput = nil
+            if screenOutputAttached {
+                do {
+                    try stream.removeStreamOutput(output, type: .screen)
+                } catch {
+                    // Same fail-closed rule as above: do not permit an orphaned
+                    // high-resolution screen output to remain attached.
+                    try? await stream.stopCapture()
+                    if self.stream === stream {
+                        self.stream = nil
+                        self.contentFilter = nil
+                        self.screenshotTarget = nil
+                        continuation?.finish(throwing: error)
+                    }
+                }
             }
-            throw error
-        }
-    }
-
-    // Device-validation-only probe. It deliberately uses the same approved filter and
-    // the smallest 16×16 screen-only configuration so one hardware run can separate
-    // "a concurrent second SCStream cannot start" from "only the high-resolution
-    // screenshot configuration fails". Product saves still use captureLearningScreenshot().
-    func deviceValidationProbeSecondScreenStreamStart() async throws {
-        guard active, let contentFilter else {
-            throw AppFailure.message("시스템 화면 캡처가 실행 중일 때만 두 번째 스트림을 검증할 수 있습니다.")
-        }
-        guard screenshotStream == nil else {
-            throw AppFailure.message("이미 저장용 스크린샷 스트림이 실행 중입니다.")
-        }
-
-        let requestID = selectionID
-        let output = ScreenFrameOutput()
-        let stream = SCStream(
-            filter: contentFilter,
-            configuration: Self.screenshotConfiguration(width: 16, height: 16),
-            delegate: nil)
-        screenshotStream = stream
-        screenshotOutput = output
-
-        do {
-            try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: output.queue)
-            try await stream.startCapture()
-            guard active, selectionID == requestID, self.screenshotStream === stream else {
-                throw AppFailure.message("화면 공유 대상이 바뀌어 두 번째 스트림 검증을 취소했습니다.")
-            }
-            // This probe is about whether the concurrent stream can enter the started
-            // state. No screenshot frame is required. Stop it immediately and leave the
-            // long-running audio stream untouched.
-            try? await stream.stopCapture()
-            if self.screenshotStream === stream {
-                screenshotStream = nil
-                screenshotOutput = nil
-            }
-        } catch {
-            try? await stream.stopCapture()
-            if self.screenshotStream === stream {
-                screenshotStream = nil
-                screenshotOutput = nil
-            }
+            if self.screenshotOutput === output { self.screenshotOutput = nil }
             throw error
         }
     }
@@ -158,22 +136,28 @@ final class SystemAudioInput: NSObject, AudioInput {
             sourceHeight: sourceHeight)
     }
 
-    private static func audioCaptureConfiguration() -> SCStreamConfiguration {
+    private static func audioCaptureConfiguration(screenTarget: ScreenshotTarget?) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.sampleRate = 48000
         config.channelCount = 2
         config.excludesCurrentProcessAudio = true
-        config.width = 16
-        config.height = 16
-        return config
-    }
 
-    private static func screenshotConfiguration(width: Int, height: Int) -> SCStreamConfiguration {
-        let config = SCStreamConfiguration()
-        config.capturesAudio = false
-        config.width = width
-        config.height = height
+        // Define the one-frame screen-output dimensions up front. This does not
+        // attach a .screen output:
+        // during normal live STT the app receives only .audio samples. A .screen
+        // destination is added temporarily only when captureLearningScreenshot()
+        // is called, then removed immediately after one frame.
+        if let screenTarget {
+            config.width = screenTarget.width
+            config.height = screenTarget.height
+        } else {
+            // Defensive fallback keeps audio capture available even if the picker
+            // doesn't provide usable content dimensions. Screenshot saving will
+            // remain unavailable for that selection.
+            config.width = 16
+            config.height = 16
+        }
         return config
     }
 
@@ -215,9 +199,8 @@ final class SystemAudioInput: NSObject, AudioInput {
     }
 
     private var stream: SCStream?
-    private var screenOutput: ScreenFrameOutput?
     private var contentFilter: SCContentFilter?
-    private var screenshotStream: SCStream?
+    private var screenshotTarget: ScreenshotTarget?
     private var screenshotOutput: ScreenFrameOutput?
     private var continuation: AsyncThrowingStream<PCMChunk, Error>.Continuation?
     private var delegate: CaptureDelegate?
@@ -247,47 +230,47 @@ final class SystemAudioInput: NSObject, AudioInput {
         guard active else { return }
         let requestID = UUID(); selectionID = requestID
 
-        let previousScreenshot = screenshotStream
         let previousScreenshotOutput = screenshotOutput
-        screenshotStream = nil; screenshotOutput = nil
+        screenshotOutput = nil
         previousScreenshotOutput?.cancelPending(AppFailure.message("화면 공유 대상이 변경되었습니다."))
-        if let previousScreenshot { try? await previousScreenshot.stopCapture() }
 
         let previous = stream
-        let previousScreenOutput = screenOutput
-        stream = nil; screenOutput = nil; contentFilter = nil
-        previousScreenOutput?.cancelPending(AppFailure.message("화면 공유 대상이 변경되었습니다."))
+        stream = nil
+        contentFilter = nil
+        screenshotTarget = nil
         if let previous { try? await previous.stopCapture() }
         guard active, selectionID == requestID else { return }
 
-        let config = Self.audioCaptureConfiguration()
+        let target = try? Self.screenshotTarget(for: filter, maxEdge: 1600)
+        let config = Self.audioCaptureConfiguration(screenTarget: target)
         guard let delegate else { return }
-        let screenOutput = ScreenFrameOutput()
         let stream = SCStream(filter: filter, configuration: config, delegate: delegate)
         self.stream = stream
-        self.screenOutput = screenOutput
         self.contentFilter = filter
+        self.screenshotTarget = target
         delegate.activate(stream)
         do {
-            try stream.addStreamOutput(screenOutput, type: .screen, sampleHandlerQueue: screenOutput.queue)
+            // Normal live operation is audio-only at the output boundary.
+            // No .screen output is attached until an explicit save requests one frame.
             try stream.addStreamOutput(delegate, type: .audio, sampleHandlerQueue: delegate.queue)
             try await stream.startCapture()
             if !active || selectionID != requestID { try? await stream.stopCapture() }
         } catch {
             if self.stream === stream {
                 self.stream = nil
-                self.screenOutput = nil
                 self.contentFilter = nil
+                self.screenshotTarget = nil
             }
-            screenOutput.cancelPending(error)
             if active && selectionID == requestID { continuation?.finish(throwing: error) }
         }
     }
 
     func stopped(_ stoppedStream: SCStream, error: Error) {
         if active && stream === stoppedStream {
-            screenOutput?.cancelPending(error)
+            screenshotOutput?.cancelPending(error)
+            screenshotOutput = nil
             contentFilter = nil
+            screenshotTarget = nil
             continuation?.finish(throwing: error)
         }
     }
@@ -295,16 +278,14 @@ final class SystemAudioInput: NSObject, AudioInput {
     func stop() async {
         active = false; selectionID = UUID()
 
-        let previousScreenshot = screenshotStream
         let previousScreenshotOutput = screenshotOutput
-        screenshotStream = nil; screenshotOutput = nil
+        screenshotOutput = nil
         previousScreenshotOutput?.cancelPending(CancellationError())
-        if let previousScreenshot { try? await previousScreenshot.stopCapture() }
 
         let previous = stream
-        let previousScreenOutput = screenOutput
-        stream = nil; screenOutput = nil; contentFilter = nil
-        previousScreenOutput?.cancelPending(CancellationError())
+        stream = nil
+        contentFilter = nil
+        screenshotTarget = nil
         continuation?.finish(); continuation = nil
         if let delegate { picker.remove(delegate) }
         picker.isActive = false

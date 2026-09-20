@@ -39,6 +39,19 @@ struct TranslationBacklog {
     mutating func complete(_ id: UUID) {
         inFlight.remove(id); failures[id] = nil; eligibleAt[id] = nil
     }
+    // A delayed quality-STT correction may change a row while its old translation is
+    // queued or in flight. Invalidate bookkeeping so the corrected source can be queued
+    // immediately; a stale response is still rejected by AppModel's source equality guard.
+    mutating func invalidate(_ ids: [UUID]) {
+        let set = Set(ids)
+        guard !set.isEmpty else { return }
+        inFlight.subtract(set)
+        for language in SourceLanguage.allCases {
+            jobs[language]?.removeAll { set.contains($0) }
+            exhausted[language]?.removeAll { set.contains($0) }
+        }
+        for id in set { failures[id] = nil; eligibleAt[id] = nil }
+    }
     func failedIDs(language: SourceLanguage) -> [UUID] { exhausted[language] ?? [] }
     mutating func retryFailed(language: SourceLanguage) -> [UUID] {
         let ids = exhausted.removeValue(forKey: language) ?? []

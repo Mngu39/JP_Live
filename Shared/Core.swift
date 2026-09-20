@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(NaturalLanguage)
+import NaturalLanguage
+#endif
 
 enum SourceLanguage: String, Codable, CaseIterable, Identifiable, Sendable {
     case japanese = "ja-JP", english = "en-US"
@@ -51,14 +54,17 @@ enum AppFailure: LocalizedError {
     var errorDescription: String? { if case .message(let text) = self { return text }; return nil }
 }
 
-// Punctuation and connecting endings are boundary hints, never a grammar parser.
-// Live broadcast speech is dense, so a short breath must not close a chunk while a
-// strong punctuation hint should still settle quickly.
-struct ChunkBoundary {
-    static let hardDuration: Double = 8
-    static let strongPause: Double = 0.30
-    static let ordinaryPause: Double = 0.78
-    static let continuationPause: Double = 1.05
+// Sentence boundaries are language boundaries, not short-pause heuristics.
+// Final SpeechTranscriber fragments accumulate in a rolling buffer; NaturalLanguage
+// decides which prefix contains complete sentences. Short breaths never seal a row.
+struct SentenceBoundary {
+    // Fallbacks only. They are intentionally much longer than ordinary speech breaths.
+    static let fallbackSilence: Double = 2.0
+    static let fallbackRecognizerIdle: Double = 2.5
+    static let fallbackDuration: Double = 20.0
+    static func fallbackCharacterLimit(_ language: SourceLanguage) -> Int {
+        language == .japanese ? 220 : 480
+    }
 
     static func hasSemanticContent(_ text: String) -> Bool {
         text.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) }
@@ -70,32 +76,43 @@ struct ChunkBoundary {
     static func hasStrongEnding(_ text: String) -> Bool {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let last = t.last else { return false }
-        return "。！？.!?".contains(last)
+        return "。！？.!?…".contains(last)
     }
-    static func isJapaneseContinuation(_ text: String) -> Bool {
-        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return [
-            "けど", "けども", "けれど", "けれども", "から", "って", "ので",
-            "のに", "なら", "たり", "とか", "というか", "それで", "て", "し", "が"
-        ].contains(where: t.hasSuffix)
+
+    // UTF-16 lengths of the complete leading sentences. The final tokenizer token is
+    // treated as provisional unless it has explicit sentence-ending punctuation: an
+    // end-of-buffer boundary alone must not recreate the old eager chunking behavior.
+    static func firstCompletedSentencePrefixUTF16Length(in text: String, language: SourceLanguage) -> Int? {
+        let source = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty else { return nil }
+        #if canImport(NaturalLanguage)
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.string = source
+        tokenizer.setLanguage(language == .japanese ? .japanese : .english)
+        let whole = source.startIndex..<source.endIndex
+        let ranges = tokenizer.tokens(for: whole)
+        guard let first = ranges.first else { return nil }
+        let piece = String(source[first])
+        // NLTokenizer necessarily treats end-of-buffer as an ending. Trust that last
+        // boundary only when punctuation makes it explicit; otherwise wait for more text.
+        if ranges.count == 1 && !hasStrongEnding(piece) { return nil }
+        return String(source[..<first.upperBound]).utf16.count
+        #else
+        // Non-Apple test hosts do not ship NaturalLanguage. Keep only explicit sentence
+        // punctuation as a deterministic fallback; Apple builds use NLTokenizer above.
+        var count = 0
+        for scalar in source.unicodeScalars {
+            count += String(scalar).utf16.count
+            if "。！？.!?…".unicodeScalars.contains(scalar) { return count }
+        }
+        return nil
+        #endif
     }
-    static func shouldCommit(_ text: String, pause: Double, duration: Double,
-                             language: SourceLanguage) -> Bool {
-        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard hasSemanticContent(t) else { return false }
-        if duration >= hardDuration || t.utf16.count >= (language == .japanese ? 110 : 240) { return true }
-        if language == .japanese && isJapaneseContinuation(t) { return pause >= continuationPause }
-        if hasStrongEnding(t) { return pause >= strongPause }
-        return pause >= ordinaryPause
-    }
-    static func split(_ text: String, limit: Int) -> [String] {
-        guard text.count > limit else { return text.isEmpty ? [] : [text] }
-        let chars = Array(text)
-        let lower = max(1, limit / 2)
-        let upper = min(chars.count - 1, limit)
-        let cut = (lower...upper).reversed().first { "、，,。！？.!? \n".contains(chars[$0 - 1]) } ?? upper
-        return [String(chars[..<cut])] + split(String(chars[cut...]), limit: limit)
-    }
+}
+
+struct TranscriptRevisionEffect: Sendable {
+    var updatedID: UUID
+    var removedIDs: [UUID]
 }
 
 

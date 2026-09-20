@@ -16,8 +16,14 @@ protocol EnhancementProvider: Actor {
 private struct PendingAudio {
     var samples: [Float]
     var start: Double
+    var enqueuedAt: Double
     var decision: SpeechDecision? = nil
     var end: Double { start + Double(samples.count)/48000 }
+}
+
+enum AudioAnalysisDeliveryPolicy: Sendable {
+    case realtime
+    case qualityRevision
 }
 
 actor AudioPreprocessor {
@@ -40,6 +46,12 @@ actor AudioPreprocessor {
     private var enhancementStartsAt: Double?
     private var analysis: (any SpeechAnalysisProvider)?
     private var enhancement: (any EnhancementProvider)?
+    private let analysisPolicy: AudioAnalysisDeliveryPolicy
+    private let maxAnalysisWait: Double = 2
+
+    init(analysisPolicy: AudioAnalysisDeliveryPolicy = .realtime) {
+        self.analysisPolicy = analysisPolicy
+    }
 
     func setProviders(analysis: (any SpeechAnalysisProvider)?, enhancement: (any EnhancementProvider)?) async {
         analysisInput?.finish(); analysisTask?.cancel(); await analysisTask?.value
@@ -154,7 +166,8 @@ actor AudioPreprocessor {
         for offset in stride(from: 0, to: mono.count, by: 480) {
             let count = min(480, mono.count-offset)
             pending.append(PendingAudio(samples: Array(mono[offset..<offset+count]),
-                start: chunk.time+Double(offset)/48000))
+                start: chunk.time+Double(offset)/48000,
+                enqueuedAt: ProcessInfo.processInfo.systemUptime))
         }
         return AudioMetrics(time: chunk.time,
             rmsDB: 20*log10(Double(max(rms, 0.000001))), peakDB: 20*log10(Double(max(peak, 0.000001))))
@@ -162,10 +175,14 @@ actor AudioPreprocessor {
     private func drain(force: Bool) async -> [PCMChunk] {
         var outputs: [PCMChunk] = []
         while var frame = pending.first {
-            // Opportunistically use analysis that has already arrived, but never wait for
-            // it. This keeps the STT transport real-time while FluidAudio continues in
-            // parallel and publishes speaker metadata through takeAnalysisUpdates().
             frame.decision = timeline.decision(start: frame.start, end: frame.end)
+            if analysisPolicy == .qualityRevision, frame.decision == nil, !force, analysisInput != nil {
+                let inputLag = (lastInputEnd ?? frame.end)-frame.start
+                let wait = ProcessInfo.processInfo.systemUptime-frame.enqueuedAt
+                if inputLag < maxAnalysisWait && wait < maxAnalysisWait { break }
+                warn("보정 STT 화자 분석 2초 초과 · 해당 구간 원본 사용")
+            }
+            // realtime never waits; qualityRevision waits only on the hidden second pass.
             pending.removeFirst()
             let enhancementEligible = enhancementStartsAt.map { frame.start >= $0-1.0/48000 } ?? true
             let mix: Float = enhancementEligible && frame.decision?.activeSpeakers == 1 && (frame.decision?.speechProbability ?? 0) >= 0.65 ? 0.35 : 0

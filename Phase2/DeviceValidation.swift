@@ -65,18 +65,9 @@ struct DeviceValidationErrorDetail: Codable, Sendable, Equatable {
     }
 }
 
-struct DeviceValidationStreamStartProbe: Codable, Sendable {
-    var attempted: Bool
-    var started: Bool
-    var duration: Double?
-    var error: DeviceValidationErrorDetail?
-}
-
 struct DeviceValidationScreenshotContinuity: Codable, Sendable {
     var attempted: Bool
     var succeeded: Bool
-    var highResolutionCaptureAttempted: Bool
-    var lowResolutionSecondStream: DeviceValidationStreamStartProbe
     var error: String?
     var errorDetail: DeviceValidationErrorDetail?
     var duration: Double?
@@ -203,7 +194,7 @@ struct DeviceValidationReport: Codable, Sendable {
         else { overall = .pass }
 
         return DeviceValidationReport(
-            schemaVersion: 4,
+            schemaVersion: 5,
             createdAt: Date(),
             appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
                 ?? Bundle.main.infoDictionary?["CFBundleVersion"] as? String
@@ -302,13 +293,8 @@ final class DeviceValidationMetricStore {
         var startedUptime: Double
         var finishedUptime: Double?
         var succeeded = false
-        var highResolutionCaptureAttempted = false
         var error: String?
         var errorDetail: DeviceValidationErrorDetail?
-        var lowResolutionStartedUptime: Double?
-        var lowResolutionFinishedUptime: Double?
-        var lowResolutionStarted = false
-        var lowResolutionError: DeviceValidationErrorDetail?
         var mime: String?
         var width: Int?
         var height: Int?
@@ -379,49 +365,11 @@ final class DeviceValidationMetricStore {
         )
     }
 
-    func markLowResolutionSecondStreamProbeStarted(
-        observedAt: Double = ProcessInfo.processInfo.systemUptime
-    ) {
-        guard var probe = screenshotProbe else { return }
-        probe.lowResolutionStartedUptime = observedAt
-        probe.lowResolutionFinishedUptime = nil
-        probe.lowResolutionStarted = false
-        probe.lowResolutionError = nil
-        screenshotProbe = probe
-    }
-
-    func markLowResolutionSecondStreamProbeFinished(
-        observedAt: Double = ProcessInfo.processInfo.systemUptime
-    ) {
-        guard var probe = screenshotProbe else { return }
-        probe.lowResolutionFinishedUptime = observedAt
-        probe.lowResolutionStarted = true
-        screenshotProbe = probe
-    }
-
-    func markLowResolutionSecondStreamProbeFailed(
-        _ error: Error,
-        observedAt: Double = ProcessInfo.processInfo.systemUptime
-    ) {
-        guard var probe = screenshotProbe else { return }
-        probe.lowResolutionFinishedUptime = observedAt
-        probe.lowResolutionStarted = false
-        probe.lowResolutionError = DeviceValidationErrorDetail(error)
-        screenshotProbe = probe
-    }
-
-    func markHighResolutionScreenshotAttemptStarted() {
-        guard var probe = screenshotProbe else { return }
-        probe.highResolutionCaptureAttempted = true
-        screenshotProbe = probe
-    }
-
     func markScreenshotProbeFinished(metadata: [String: Any],
                                      observedAt: Double = ProcessInfo.processInfo.systemUptime) {
         guard var probe = screenshotProbe else { return }
         probe.finishedUptime = observedAt
         probe.succeeded = true
-        probe.highResolutionCaptureAttempted = true
         probe.mime = metadata["mime"] as? String
         probe.width = metadata["width"] as? Int
         probe.height = metadata["height"] as? Int
@@ -431,13 +379,11 @@ final class DeviceValidationMetricStore {
 
     func markScreenshotProbeFailed(
         _ error: Error,
-        highResolutionAttempted: Bool,
         observedAt: Double = ProcessInfo.processInfo.systemUptime
     ) {
         guard var probe = screenshotProbe else { return }
         probe.finishedUptime = observedAt
         probe.succeeded = false
-        probe.highResolutionCaptureAttempted = highResolutionAttempted
         probe.error = error.localizedDescription
         probe.errorDetail = DeviceValidationErrorDetail(error)
         screenshotProbe = probe
@@ -554,8 +500,7 @@ final class DeviceValidationMetricStore {
     private func screenshotContinuityReport() -> DeviceValidationScreenshotContinuity {
         guard let probe = screenshotProbe else {
             return DeviceValidationScreenshotContinuity(
-                attempted: false, succeeded: false, highResolutionCaptureAttempted: false,
-                lowResolutionSecondStream: .init(attempted: false, started: false, duration: nil, error: nil),
+                attempted: false, succeeded: false,
                 error: nil, errorDetail: nil, duration: nil, mime: nil, width: nil, height: nil, sizeBytes: nil,
                 rawWindowCompleted: false, rawGapCount: 0, rawGapSeconds: 0, rawOverlapCount: 0, rawOverlapSeconds: 0,
                 processedWindowCompleted: false, processedGapCount: 0, processedGapSeconds: 0, processedOverlapCount: 0, processedOverlapSeconds: 0,
@@ -577,19 +522,8 @@ final class DeviceValidationMetricStore {
         else if !completed { verdict = .warning }
         else { verdict = .pass }
 
-        let lowResolutionAttempted = probe.lowResolutionStartedUptime != nil
-        let lowResolutionDuration = probe.lowResolutionFinishedUptime.flatMap { finished in
-            probe.lowResolutionStartedUptime.map { max(0, finished - $0) }
-        }
-
         return DeviceValidationScreenshotContinuity(
             attempted: true, succeeded: probe.succeeded,
-            highResolutionCaptureAttempted: probe.highResolutionCaptureAttempted,
-            lowResolutionSecondStream: .init(
-                attempted: lowResolutionAttempted,
-                started: probe.lowResolutionStarted,
-                duration: lowResolutionDuration,
-                error: probe.lowResolutionError),
             error: probe.error, errorDetail: probe.errorDetail,
             duration: probe.finishedUptime.map { max(0, $0 - probe.startedUptime) },
             mime: probe.mime, width: probe.width, height: probe.height, sizeBytes: probe.sizeBytes,
@@ -699,25 +633,11 @@ final class DeviceValidationMetricStore {
             if !screenshot.attempted {
                 detail = "스크린샷 캡처 검증이 실행되지 않았습니다. 실제 PCM이 5초 이상 흐른 뒤 자동 실행되도록 세션을 충분히 유지하세요."
             } else if !screenshot.succeeded {
-                let low = screenshot.lowResolutionSecondStream
-                let lowState: String
-                if !low.attempted {
-                    lowState = "16×16 second-stream 미실행"
-                } else if low.started {
-                    lowState = "16×16 second-stream START PASS"
-                } else if let error = low.error {
-                    lowState = "16×16 second-stream START FAIL [\(error.domain) \(error.code)] \(error.localizedDescription)"
-                } else {
-                    lowState = "16×16 second-stream START FAIL"
-                }
-                let highState = screenshot.highResolutionCaptureAttempted ? "high-res attempted" : "high-res skipped"
-                let highError: String
                 if let error = screenshot.errorDetail {
-                    highError = "[\(error.domain) \(error.code)] \(error.localizedDescription)"
+                    detail = "same-stream one-shot screen output FAIL [\(error.domain) \(error.code)] \(error.localizedDescription)"
                 } else {
-                    highError = screenshot.error ?? "원인 미기록"
+                    detail = "same-stream one-shot screen output FAIL · \(screenshot.error ?? "원인 미기록")"
                 }
-                detail = "\(lowState) · \(highState) · \(highError)"
             } else {
                 let duration = screenshot.duration.map { Self.seconds($0) } ?? "?"
                 let size = [screenshot.width, screenshot.height].compactMap { $0 }.map(String.init).joined(separator: "×")
@@ -884,30 +804,16 @@ final class DeviceValidationController: ObservableObject {
                     metrics.markScreenshotProbeStarted()
                     status = "PCM 수신 중 · 스크린샷/오디오 연속성 검증 중…"
                     screenshotTask = Task { @MainActor [weak self] in
-                        metrics.markLowResolutionSecondStreamProbeStarted()
-                        do {
-                            try await input.deviceValidationProbeSecondScreenStreamStart()
-                            metrics.markLowResolutionSecondStreamProbeFinished()
-                        } catch {
-                            metrics.markLowResolutionSecondStreamProbeFailed(error)
-                            metrics.markScreenshotProbeFailed(error, highResolutionAttempted: false)
-                            if self?.running == true && self?.stopRequested == false {
-                                self?.status = "PCM 수신 중 · 16×16 second stream 시작 실패 · 계속 재생 후 JSON을 확인하세요."
-                            }
-                            return
-                        }
-
-                        metrics.markHighResolutionScreenshotAttemptStarted()
                         do {
                             let metadata = try await input.captureLearningScreenshot()
                             metrics.markScreenshotProbeFinished(metadata: metadata)
                             if self?.running == true && self?.stopRequested == false {
-                                self?.status = "PCM 수신 중 · 16×16/high-res 검증 완료 · 5초 이상 더 재생하세요."
+                                self?.status = "PCM 수신 중 · same-stream 스크린샷 완료 · 5초 이상 더 재생하세요."
                             }
                         } catch {
-                            metrics.markScreenshotProbeFailed(error, highResolutionAttempted: true)
+                            metrics.markScreenshotProbeFailed(error)
                             if self?.running == true && self?.stopRequested == false {
-                                self?.status = "PCM 수신 중 · high-res screenshot stream 실패 · 계속 재생 후 JSON을 확인하세요."
+                                self?.status = "PCM 수신 중 · same-stream 스크린샷 실패 · 계속 재생 후 JSON을 확인하세요."
                             }
                         }
                     }

@@ -12,8 +12,8 @@ struct DeviceValidationView: View {
                 Section("사용 방법") {
                     Text("1. 검증 시작 → 화면 전체 공유를 선택")
                     Text("2. 유튜브 등에서 실제 음성/대사를 20~30초 재생")
-                    Text("3. 실제 PCM 약 5초 후 16×16 screen-only second stream의 시작을 먼저 검증하고, 성공할 때만 저장과 같은 고해상도 second stream을 이어서 실행합니다")
-                    Text("4. probe 뒤 최소 5초 이상 계속 재생한 다음 이 앱으로 돌아와 검증 정지")
+                    Text("3. 실제 PCM 약 5초 후 현재 오디오 SCStream에 screen output을 잠깐 붙여 고해상도 프레임 1장을 받고 즉시 제거합니다")
+                    Text("4. 스크린샷 뒤 최소 5초 이상 계속 재생한 다음 이 앱으로 돌아와 검증 정지")
                     Text("5. 같은 과정을 한 번 더 실행하면 stop → restart와 시간축 초기화까지 검증")
                     Text("전사 문장은 저장하지 않고 PCM/STT 수치와 PASS/FAIL만 JSON에 기록합니다.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -34,8 +34,7 @@ struct DeviceValidationView: View {
                         LabeledContent("전처리 PCM", value: "\(latest.processedChunks) chunks · \(String(format: "%.2f", latest.processedAudioDuration)) s")
                         LabeledContent("Analyzer 입력", value: "\(latest.analyzerChunks) chunks · \(String(format: "%.2f", latest.analyzerAudioDuration)) s")
                         LabeledContent("STT 결과", value: "\(latest.speechResults) · final \(latest.finalSpeechResults)")
-                        LabeledContent("16×16 second stream", value: secondStreamProbeTitle(latest.screenshotContinuity.lowResolutionSecondStream))
-                        LabeledContent("high-res 시도", value: latest.screenshotContinuity.highResolutionCaptureAttempted ? "YES" : "NO")
+                        LabeledContent("same-stream 스크린샷", value: latest.screenshotContinuity.succeeded ? "SUCCESS" : (latest.screenshotContinuity.attempted ? "FAIL" : "NOT TESTED"))
                         LabeledContent("스크린샷 연속성", value: verdictTitle(latest.screenshotContinuity.verdict))
                         ForEach(latest.checks) { check in
                             VStack(alignment: .leading, spacing: 3) {
@@ -85,12 +84,6 @@ struct DeviceValidationView: View {
         }
     }
 
-    private func secondStreamProbeTitle(_ value: DeviceValidationStreamStartProbe) -> String {
-        guard value.attempted else { return "NOT TESTED" }
-        if value.started { return "START PASS" }
-        if let error = value.error { return "FAIL (\(error.domain) \(error.code))" }
-        return "START FAIL"
-    }
 
     private func verdictTitle(_ value: DeviceValidationVerdict) -> String {
         switch value {

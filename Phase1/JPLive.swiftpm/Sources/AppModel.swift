@@ -3,6 +3,13 @@ import Translation
 
 @MainActor
 final class AppModel: ObservableObject {
+    private struct BufferedSpeechResult {
+        var text: String
+        var final: Bool
+        var start: Double
+        var end: Double
+    }
+
     private struct DraftTranslationRequest {
         var id: UUID
         var captureID: UUID
@@ -13,6 +20,7 @@ final class AppModel: ObservableObject {
 
     @Published var language: SourceLanguage = .japanese
     @Published private var transcript = TranscriptBuffer()
+    private var revisionTranscript = TranscriptBuffer()
     var captions: [Caption] {
         get { transcript.rows }
         set { transcript.rows = newValue }
@@ -44,6 +52,10 @@ final class AppModel: ObservableObject {
     private var lastDraftTranslationStartedAt: Double = -Double.greatestFiniteMagnitude
     private var translatedDraftSources: [UUID: String] = [:]
     private let draftTranslationInterval: Double = 0.35
+    private let primaryVolatileDebounce: Double = 0.15
+    private var bufferedPrimaryVolatile: BufferedSpeechResult?
+    private var primaryVolatileTask: Task<Void, Never>?
+    private(set) var qualityRevisionCount = 0
     var hasFailedTranslations: Bool { !translationJobs.failedIDs(language: language).isEmpty }
     private var languageChangeID = UUID()
 
@@ -109,6 +121,9 @@ final class AppModel: ObservableObject {
         let thisCapture = captureID
         let sourceLanguage = language
         transcript.begin(captureID: thisCapture, language: sourceLanguage)
+        revisionTranscript.begin(captureID: thisCapture, language: sourceLanguage)
+        primaryVolatileTask?.cancel(); primaryVolatileTask = nil; bufferedPrimaryVolatile = nil
+        qualityRevisionCount = 0
         speechTimeline = SpeechTimeline(); speakerHints = SoftSpeakerMapper(); audioThrough = nil
         draftTranslationRequest = nil; translatedDraftSources.removeAll(); lastDraftTranslationStartedAt = -Double.greatestFiniteMagnitude
         // Required STT/input share one lifetime. Optional loading has a separate
@@ -120,24 +135,39 @@ final class AppModel: ObservableObject {
     }
 
     private func run(_ newInput: any AudioInput, capture: UUID, language: SourceLanguage) async {
-        let pipeline = AudioPreprocessor(); let speech = AppleSpeechEngine()
+        let pipeline = AudioPreprocessor()
+        let revisionPipeline = AudioPreprocessor(analysisPolicy: .qualityRevision)
+        let speech = AppleSpeechEngine()
+        let revisionSpeech = AppleSpeechEngine()
         let optional = OptionalProviderPreparation()
         var optionalStarted = false
+        var revisionPrepared = false
+        var revisionPipelineStarted = false
         var inputFailure: Error?
         do {
             try Task.checkCancellation()
             status = "Apple STT 준비 중…"
             try await speech.prepare(language: language, result: { [weak self] text, final, start, end in
                 guard let self, self.captureID == capture else { return }
-                let ready = self.transcript.receive(text, final: final, start: start, end: end,
-                    speaker: self.speechTimeline.speaker(start: start, end: end), now: ProcessInfo.processInfo.systemUptime)
-                self.enqueueTranslations(ready, language: language)
-                self.queueDraftTranslation(language: language)
-                self.scheduleMorphology(ready + [self.transcript.draftRowID].compactMap { $0 })
+                self.receivePrimarySpeech(.init(text: text, final: final, start: start, end: end), language: language)
             }, failure: { [weak self] message in
                 guard let self, self.captureID == capture else { return }
                 self.status = "STT 오류: " + message
             })
+            do {
+                try await revisionSpeech.prepare(language: language, result: { [weak self] text, final, start, end in
+                    guard let self, self.captureID == capture else { return }
+                    let ready = self.revisionTranscript.receive(text, final: final, start: start, end: end,
+                        speaker: self.speechTimeline.speaker(start: start, end: end), now: ProcessInfo.processInfo.systemUptime)
+                    self.applyQualityRevisions(ready, language: language)
+                }, failure: { [weak self] message in
+                    guard let self, self.captureID == capture else { return }
+                    self.featureStatus = "보정 STT 오류 · 빠른 STT 유지: " + message
+                })
+                revisionPrepared = true
+            } catch {
+                featureStatus = "보정 STT 준비 실패 · 빠른 STT 유지"
+            }
             try Task.checkCancellation()
             let sequence = try await newInput.start()
             try Task.checkCancellation()
@@ -146,25 +176,37 @@ final class AppModel: ObservableObject {
                 while !Task.isCancelled {
                     do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
                     guard let self, self.captureID == capture else { return }
-                    self.applyAnalysisUpdates(await pipeline.takeAnalysisUpdates())
+                    self.applyAnalysisUpdates(await revisionPipeline.takeAnalysisUpdates())
                     let activityEnd = self.speechTimeline.latestEnd.map { min($0, self.audioThrough ?? $0) }
                     let activity = activityEnd.flatMap { self.speechTimeline.activity(through: $0) }
-                    let ready = self.transcript.tick(now: ProcessInfo.processInfo.systemUptime, activity: activity)
+                    let now = ProcessInfo.processInfo.systemUptime
+                    let ready = self.transcript.tick(now: now, activity: activity)
                     self.enqueueTranslations(ready, language: language)
                     self.queueDraftTranslation(language: language)
                     self.scheduleMorphology(ready + [self.transcript.draftRowID].compactMap { $0 })
+                    let revisionReady = self.revisionTranscript.tick(now: now, activity: activity)
+                    self.applyQualityRevisions(revisionReady, language: language)
                 }
             }
             for try await chunk in sequence {
                 try Task.checkCancellation()
                 let ready = await optional.takeReady()
                 try Task.checkCancellation()
-                await pipeline.installPrepared(analysis: ready.analysis, enhancement: ready.enhancement)
+                // The fast path never waits for diarization. Optional analysis/enhancement
+                // belong to the hidden quality pass, which may lag without delaying UI.
+                if ready.analysis != nil || ready.enhancement != nil {
+                    await revisionPipeline.installPrepared(analysis: ready.analysis, enhancement: ready.enhancement)
+                    if ready.analysis != nil { revisionPipelineStarted = true }
+                }
                 try Task.checkCancellation()
                 featureStatus = ready.status
                 let (processed, value) = try await pipeline.process(chunk)
                 metrics = value
                 for output in processed { rememberAudio(output); try speech.append(output) }
+                if revisionPipelineStarted, revisionPrepared {
+                    let (revised, _) = try await revisionPipeline.process(chunk)
+                    for output in revised { rememberRevisionAudio(output); try revisionSpeech.append(output) }
+                }
                 // Picker/input and the first basic STT buffer precede optional
                 // downloads. Later completions are installed at the next boundary.
                 if !optionalStarted && !processed.isEmpty {
@@ -187,25 +229,41 @@ final class AppModel: ObservableObject {
             do {
                 if drainAcceptedAudio {
                     let tails = try await pipeline.finish(cancelAnalysis: wasCancelled)
-                    self.applyAnalysisUpdates(await pipeline.takeAnalysisUpdates())
                     for tail in tails {
                         self.rememberAudio(tail); try speech.append(tail)
                     }
                     try await speech.finish()
+                    if revisionPipelineStarted, revisionPrepared {
+                        let revisionTails = try await revisionPipeline.finish(cancelAnalysis: wasCancelled)
+                        self.applyAnalysisUpdates(await revisionPipeline.takeAnalysisUpdates())
+                        for tail in revisionTails {
+                            self.rememberRevisionAudio(tail); try revisionSpeech.append(tail)
+                        }
+                        try await revisionSpeech.finish()
+                        let revisionReady = self.revisionTranscript.finish()
+                        self.applyQualityRevisions(revisionReady, language: language)
+                    } else if revisionPrepared {
+                        try await revisionSpeech.finish(aborting: true)
+                    }
                 } else {
                     await pipeline.cancel()
+                    await revisionPipeline.cancel()
                     try await speech.finish(aborting: true)
+                    if revisionPrepared { try? await revisionSpeech.finish(aborting: true) }
                 }
                 return nil
             } catch {
                 let message = error.localizedDescription
                 await pipeline.cancel()
+                await revisionPipeline.cancel()
                 do { try await speech.finish(aborting: true) } catch { /* Keep the first failure. */ }
+                if revisionPrepared { try? await revisionSpeech.finish(aborting: true) }
                 return message
             }
         }
         let cleanupFailure = await cleanup.value
         if inputFailure == nil, let cleanupFailure { status = cleanupFailure }
+        primaryVolatileTask?.cancel(); primaryVolatileTask = nil; bufferedPrimaryVolatile = nil
         let ready = transcript.finish()
         enqueueTranslations(ready, language: language); queueDraftTranslation(language: language)
         scheduleMorphology(ready + captions.suffix(1).map(\.id))
@@ -213,6 +271,70 @@ final class AppModel: ObservableObject {
         if Task.isCancelled && inputFailure == nil && cleanupFailure == nil { status = "입력 중지" }
         else if status == "듣는 중" { status = "입력 완료" }
         running = false
+    }
+
+    private func receivePrimarySpeech(_ result: BufferedSpeechResult, language: SourceLanguage) {
+        if result.final {
+            primaryVolatileTask?.cancel(); primaryVolatileTask = nil; bufferedPrimaryVolatile = nil
+            applyPrimarySpeech(result, language: language)
+            return
+        }
+        bufferedPrimaryVolatile = result
+        guard primaryVolatileTask == nil else { return }
+        let debounceMilliseconds = Int(primaryVolatileDebounce * 1000)
+        primaryVolatileTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(debounceMilliseconds)) } catch { return }
+            guard let self else { return }
+            let latest = self.bufferedPrimaryVolatile
+            self.bufferedPrimaryVolatile = nil
+            self.primaryVolatileTask = nil
+            if let latest { self.applyPrimarySpeech(latest, language: language) }
+        }
+    }
+
+    private func applyPrimarySpeech(_ result: BufferedSpeechResult, language: SourceLanguage) {
+        let ready = transcript.receive(result.text, final: result.final, start: result.start, end: result.end,
+            speaker: speechTimeline.speaker(start: result.start, end: result.end), now: ProcessInfo.processInfo.systemUptime)
+        enqueueTranslations(ready, language: language)
+        queueDraftTranslation(language: language)
+        scheduleMorphology(ready + [transcript.draftRowID].compactMap { $0 })
+        if !ready.isEmpty {
+            // A quality sentence can arrive before the fast path has sealed its row.
+            // Retry only the recent hidden finals when a new visible sentence appears.
+            for revised in revisionTranscript.rows.suffix(8) where revised.isFinal {
+                applyQualityCaption(revised, language: language)
+            }
+        }
+    }
+
+    private func applyQualityRevisions(_ ids: [UUID], language: SourceLanguage) {
+        for id in ids {
+            guard let revised = revisionTranscript.rows.first(where: { $0.id == id && $0.isFinal }) else { continue }
+            applyQualityCaption(revised, language: language)
+        }
+    }
+
+    private func applyQualityCaption(_ revised: Caption, language: SourceLanguage) {
+        guard let effect = transcript.applyRevision(revised) else { return }
+        qualityRevisionCount += 1
+        let invalid = [effect.updatedID] + effect.removedIDs
+        translationJobs.invalidate(invalid)
+        translatedDraftSources[effect.updatedID] = nil
+        for removed in effect.removedIDs {
+            translatedDraftSources[removed] = nil
+            morphologyTasks.removeValue(forKey: removed)?.cancel()
+            morphologyRequests[removed] = nil; morphologySources[removed] = nil
+        }
+        enqueueTranslations([effect.updatedID], language: language)
+        scheduleMorphology([effect.updatedID])
+    }
+
+    private func rememberRevisionAudio(_ output: PCMChunk) {
+        let end = output.time + Double(output.buffer.frameLength)/output.buffer.format.sampleRate
+        if var decision = output.decision {
+            decision.start = output.time; decision.end = end
+            applyAnalysisUpdates([decision])
+        }
     }
 
     private func rememberAudio(_ output: PCMChunk) {
@@ -268,6 +390,8 @@ final class AppModel: ObservableObject {
 
     func clearTranscript() {
         transcript.clearDisplay()
+        revisionTranscript.clearDisplay()
+        primaryVolatileTask?.cancel(); primaryVolatileTask = nil; bufferedPrimaryVolatile = nil
         for task in morphologyTasks.values { task.cancel() }
         morphologyTasks.removeAll(); morphologyRequests.removeAll(); morphologySources.removeAll()
         translationJobs = TranslationBacklog()
@@ -312,7 +436,7 @@ final class AppModel: ObservableObject {
         guard language == self.language,
               let id = transcript.draftRowID,
               let row = captions.first(where: { $0.id == id && !$0.isFinal && $0.language == language }),
-              ChunkBoundary.hasSemanticContent(row.source) else {
+              SentenceBoundary.hasSemanticContent(row.source) else {
             draftTranslationRequest = nil
             return
         }
