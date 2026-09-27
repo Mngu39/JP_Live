@@ -102,11 +102,23 @@ final class CoreTests: XCTestCase {
         XCTAssertFalse(next.acceptingInput)
         XCTAssertTrue(next.diagnostics.stoppedReason?.contains("이전 보정 작업") == true)
         sink.releaseFinish()
-        await pass.finish(aborting: false)
+        // The first finish intentionally uses a 10 ms budget to force the timeout path.
+        // After releasing the synthetic native finish gate, wait independently for the
+        // cancelled worker to unwind and release the process-wide lease. Reusing the same
+        // 10 ms finish budget here made this test scheduler-dependent on GitHub runners.
+        var released = false
+        let deadline = ContinuousClock.now + .seconds(2)
+        while ContinuousClock.now < deadline {
+            let probe = UUID()
+            if QualityWorkLease.acquire(probe) {
+                QualityWorkLease.release(probe)
+                released = true
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(released, "Quality worker did not release its lease after native finish resumed")
         await next.finish(aborting: true)
-        let lease = UUID()
-        XCTAssertTrue(QualityWorkLease.acquire(lease))
-        QualityWorkLease.release(lease)
     }
 
     @MainActor
@@ -1546,7 +1558,11 @@ private final class TestQualitySpeechSink: QualitySpeechSink {
     }
     func waitUntilPreparationStarted() async {
         if prepared { return }
-        await withCheckedContinuation { waiters.append($0) }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !prepared && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(prepared, "Timed out waiting for quality speech preparation")
     }
     func releasePreparation() { gate?.resume(); gate = nil }
     func emitResult() { result?("遅れて届いた結果。", true, 0, 1, 1) }
@@ -1559,7 +1575,11 @@ private final class TestQualitySpeechSink: QualitySpeechSink {
     }
     func waitUntilFinishStarted() async {
         if finishStarted { return }
-        await withCheckedContinuation { finishWaiters.append($0) }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !finishStarted && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(finishStarted, "Timed out waiting for quality speech finish")
     }
     func releaseFinish() { finishReleased = true; finishGate?.resume(); finishGate = nil }
 }
@@ -1576,7 +1596,11 @@ private actor SuspendedPreparation {
     }
     func waitUntilStarted() async {
         if started { return }
-        await withCheckedContinuation { startedWaiters.append($0) }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !started && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(started, "Timed out waiting for synthetic provider preparation")
     }
     func release() { continuation?.resume(); continuation = nil }
 }

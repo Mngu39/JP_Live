@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import shutil
 
-VERSIONS = {'SudachiPy': '0.6.11', 'SudachiDict-full': '20260723.1'}
+VERSIONS = {'SudachiPy': '0.7.0', 'SudachiDict-full': '20260723.1'}
 
 def prepare(destination):
     destination = Path(destination)

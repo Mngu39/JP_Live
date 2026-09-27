@@ -29,7 +29,7 @@
     "revision": "90fd6068c80c2fc3b63e0dbab0e341475bad4d8f",
     "status": "A/B/C source and Phase 2 build wiring present; native build/assets/runtime NOT RUN",
     "resourcePackages": {
-      "SudachiPy": "0.6.11",
+      "SudachiPy": "0.7.0",
       "SudachiDict-full": "20260723.1"
     },
     "generatedAssets": "BuildOutputs/Sudachi",

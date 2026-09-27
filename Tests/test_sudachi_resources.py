@@ -48,6 +48,15 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(module.hashlib.sha256((self.output/name).read_bytes()).hexdigest(), expected)
         self.assertEqual(len(list((self.output/'licenses').rglob('LICENSE'))), 2)
 
+
+    def test_version_pins_match_build_script_and_dependency_inventory(self):
+        root = Path(__file__).parents[1]
+        script = (root/'Tools/build-sudachi-macos.sh').read_text(encoding='utf-8')
+        inventory = json.loads((root/'DEPENDENCIES.json').read_text(encoding='utf-8'))['Sudachi']['resourcePackages']
+        for name, version in module.VERSIONS.items():
+            self.assertIn(f"'{name}=={version}'", script)
+            self.assertEqual(inventory[name], version)
+
     def test_version_mismatch_rejected(self):
         self.packages['SudachiPy'].version = 'unexpected'
         with self.assertRaisesRegex(ValueError, 'expected'): module.prepare(self.output)
