@@ -1,3 +1,18 @@
+# stage8.7 Chat CI follow-up — 2026-09-28
+
+The stage8.6 Phase 2 rerun passed the resource/license preparation and advanced through native Sudachi. The new failure is an Xcode static-XCFramework header-output collision, not a product/STT/runtime failure.
+
+- `SudachiPy==0.6.11` + `SudachiDict-full==20260723` installed successfully.
+- Sudachi resource tests passed; the real-dictionary Rust bridge tests passed 2/2; all three iOS Rust target builds completed; `SudachiBridge.xcframework` was created; Xcode package resolution completed.
+- Simulator XCTest did **not** execute because Xcode stopped while processing binary XCFrameworks: our `SudachiBridge.xcframework` and FluidAudio's `NemoTextProcessing.xcframework` both attempted to produce `Debug-iphonesimulator/include/module.modulemap`.
+- **No app/STT/native-Rust behavior changes.** stage8.7 only namespaces the existing Sudachi C header and module map under `Headers/SudachiBridge/` before `xcodebuild -create-xcframework`.
+- The Clang module stays named `SudachiBridge`; Swift source keeps `import SudachiBridge`.
+- Phase 2 must be rerun. Phase 1 remains the established stage8.4 PASS and does not need rerunning.
+
+The stage8.3 STT correctness changes and stage8.4–8.6 CI/tooling fixes are otherwise unchanged.
+
+---
+
 # stage8.6 Chat CI follow-up — 2026-09-28
 
 The stage8.5 Phase 2 rerun installed the intended compatible resource family (`SudachiPy==0.6.11` + `SudachiDict-full==20260723`) successfully, so the prior resolver/resource-generation mismatch is not recurring. It stopped earlier than the Rust dictionary test because the released macOS SudachiPy 0.6.11 wheel exposes no packaged `LICENSE`/`COPYING`/`NOTICE` file through `importlib.metadata.Distribution.files`, and our staging guard treated that packaging omission as fatal.

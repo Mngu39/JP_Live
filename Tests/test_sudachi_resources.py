@@ -72,6 +72,18 @@ class PackagingTests(unittest.TestCase):
             self.assertIn(f"'{name}=={version}'", script)
             self.assertEqual(inventory[name], version)
 
+    def test_xcframework_headers_are_namespaced(self):
+        root = Path(__file__).parents[1]
+        script = (root/'Tools/build-sudachi-macos.sh').read_text(encoding='utf-8')
+        self.assertIn('XC_HEADERS="$STAGE/XCHeaders"', script)
+        self.assertIn('mkdir -p "$XC_HEADERS/SudachiBridge"', script)
+        self.assertIn(
+            'cp include/SudachiBridge.h include/module.modulemap "$XC_HEADERS/SudachiBridge/"',
+            script,
+        )
+        self.assertEqual(script.count('-headers "$XC_HEADERS"'), 2)
+        self.assertNotIn('-headers include', script)
+
     def test_rust_and_resource_version_family_stays_compatible(self):
         root = Path(__file__).parents[1]
         cargo = (root/'Native/SudachiBridge/Cargo.toml').read_text(encoding='utf-8')

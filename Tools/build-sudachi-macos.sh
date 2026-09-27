@@ -22,9 +22,15 @@ cargo build --locked --release --target x86_64-apple-ios
 mkdir -p target/universal-simulator
 lipo -create target/aarch64-apple-ios-sim/release/libSudachiBridge.a \
   target/x86_64-apple-ios/release/libSudachiBridge.a -output target/universal-simulator/libSudachiBridge.a
+# Xcode copies static-XCFramework headers into one build-product include tree.
+# Namespace ours so a generic root Headers/module.modulemap cannot collide with
+# another binary dependency's root module map.
+XC_HEADERS="$STAGE/XCHeaders"
+mkdir -p "$XC_HEADERS/SudachiBridge"
+cp include/SudachiBridge.h include/module.modulemap "$XC_HEADERS/SudachiBridge/"
 xcodebuild -create-xcframework \
-  -library target/aarch64-apple-ios/release/libSudachiBridge.a -headers include \
-  -library target/universal-simulator/libSudachiBridge.a -headers include \
+  -library target/aarch64-apple-ios/release/libSudachiBridge.a -headers "$XC_HEADERS" \
+  -library target/universal-simulator/libSudachiBridge.a -headers "$XC_HEADERS" \
   -output "$STAGE/SudachiBridge.xcframework"
 mkdir -p "$STAGE/Ready"
 mv "$STAGE/SudachiBridge.xcframework" "$STAGE/Ready/"
