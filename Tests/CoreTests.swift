@@ -3,6 +3,388 @@ import AVFoundation
 @testable import JPLive
 
 final class CoreTests: XCTestCase {
+    @MainActor
+    func testPrimaryEOFPreservesLatestDebouncedVolatileAsUnconfirmed() {
+        let model = AppModel()
+        defer { model.clearTranscript() }
+        model.receivePrimarySpeech(.init(text: "古い仮説", final: false, start: 0, end: 1), language: .japanese)
+        model.receivePrimarySpeech(.init(text: "最後の仮説", final: false, start: 0, end: 1), language: .japanese)
+        XCTAssertTrue(model.captions.isEmpty, "Result is still waiting for debounce")
+        XCTAssertTrue(model.finishPrimaryTranscript(language: .japanese).isEmpty)
+        XCTAssertEqual(model.captions.count, 1)
+        XCTAssertEqual(model.captions.first?.source, "最後の仮説")
+        XCTAssertEqual(model.captions.first?.isFinal, false)
+        XCTAssertEqual(model.captions.first?.translationError, "인식 종료 · 미확정 원문")
+    }
+
+    @MainActor
+    func testClearPreventsDebouncedSpeechFromReturningAtEOF() {
+        let model = AppModel()
+        model.receivePrimarySpeech(.init(text: "消した仮説", final: false, start: 0, end: 1), language: .japanese)
+        model.clearTranscript()
+        _ = model.finishPrimaryTranscript(language: .japanese)
+        XCTAssertTrue(model.captions.isEmpty)
+    }
+
+    @MainActor
+    func testClearWatermarkCoversCapturedButNotYetProcessedAudio() {
+        XCTAssertEqual(AppModel.clearWatermark(processedThrough: 3, capturedThrough: 5), 5)
+        XCTAssertEqual(AppModel.clearWatermark(processedThrough: 7, capturedThrough: 5), 7)
+        XCTAssertEqual(AppModel.clearWatermark(processedThrough: nil, capturedThrough: 5), 5)
+        XCTAssertEqual(AppModel.clearWatermark(processedThrough: 3, capturedThrough: nil), 3)
+        XCTAssertNil(AppModel.clearWatermark(processedThrough: .nan, capturedThrough: .infinity))
+    }
+
+    @MainActor
+    func testFinalSpeechSupersedesBufferedVolatileBeforeEOF() {
+        let model = AppModel()
+        defer { model.clearTranscript() }
+        model.receivePrimarySpeech(.init(text: "古い仮説", final: false, start: 0, end: 1), language: .japanese)
+        model.receivePrimarySpeech(.init(text: "確定した文。", final: true, start: 0, end: 1), language: .japanese)
+        _ = model.finishPrimaryTranscript(language: .japanese)
+        XCTAssertEqual(model.captions.map(\.source), ["確定した文。"])
+        XCTAssertTrue(model.captions.allSatisfy(\.isFinal))
+    }
+
+    @MainActor
+    func testDebounceCannotDropPriorPhraseFinalizedByNextResult() {
+        let model = AppModel()
+        defer { model.clearTranscript() }
+        // Both callbacks arrive before the 150 ms visual debounce can fire. Apple may
+        // finalize the first phrase only by advancing resultsFinalizationTime on the next
+        // result, without re-emitting the first text with isFinal == true.
+        model.receivePrimarySpeech(.init(text: "今日は", final: false, start: 0, end: 1, finalizedThrough: 0),
+                                   language: .japanese)
+        model.receivePrimarySpeech(.init(text: "晴れ。", final: true, start: 1, end: 2, finalizedThrough: 2),
+                                   language: .japanese)
+        XCTAssertEqual(model.captions.map(\.source), ["今日は晴れ。"])
+        XCTAssertTrue(model.captions.allSatisfy(\.isFinal))
+    }
+
+    func testSeparatedGutterColorsDoNotMutateDiarizerTracking() {
+        var mapper = SoftSpeakerMapper()
+        _ = mapper.hint(slot: 7, start: 0, end: 1)
+        var control = mapper
+        var row = Caption(captureID: UUID(), language: .japanese, source: "分離。", start: 100, end: 101,
+                          isFinal: true, speaker: 0, gutterHint: .first, separationGroup: UUID())
+        XCTAssertEqual(mapper.hint(for: row), .first)
+        row.speaker = 1; row.gutterHint = .second
+        XCTAssertEqual(mapper.hint(for: row), .second)
+        for index in 1...8 {
+            let start = Double(index)
+            XCTAssertEqual(mapper.hint(slot: index % 2, start: start, end: start+1),
+                           control.hint(slot: index % 2, start: start, end: start+1))
+        }
+    }
+
+    @MainActor
+    func testQualityEOFBudgetReturnsWithoutReleasingUnfinishedNativeWork() async {
+        let setup = OptionalProviderPreparation()
+        await setup.start(analysis: nil, enhancement: nil)
+        let sink = TestQualitySpeechSink(holdPreparation: false, holdFinish: true)
+        var delivered = 0
+        let pass = QualitySpeechPass(pipeline: AudioPreprocessor(), language: .japanese, speech: sink,
+            optional: setup, finishTimeout: 0.01, result: { _, _, _, _, _ in delivered += 1 },
+            output: { _ in }, status: { _ in })
+        pass.offer(Self.pcm(count: 4800, time: 0))
+        await sink.waitUntilPreparationStarted()
+        for _ in 0..<100 { if pass.acceptingInput { break }; await Task.yield() }
+        XCTAssertTrue(pass.acceptingInput)
+        await pass.finish(aborting: false)
+        XCTAssertEqual(pass.diagnostics.overloadStops, 1)
+        sink.emitResult(); XCTAssertEqual(delivered, 0)
+        let nextSetup = OptionalProviderPreparation()
+        await nextSetup.start(analysis: nil, enhancement: nil)
+        let next = QualitySpeechPass(pipeline: AudioPreprocessor(), language: .japanese,
+            speech: TestQualitySpeechSink(holdPreparation: false), optional: nextSetup,
+            result: { _, _, _, _, _ in XCTFail("Overlapping quality pass") }, output: { _ in }, status: { _ in })
+        next.offer(Self.pcm(count: 4800, time: 0))
+        XCTAssertFalse(next.acceptingInput)
+        XCTAssertTrue(next.diagnostics.stoppedReason?.contains("이전 보정 작업") == true)
+        sink.releaseFinish()
+        await pass.finish(aborting: false)
+        await next.finish(aborting: true)
+        let lease = UUID()
+        XCTAssertTrue(QualityWorkLease.acquire(lease))
+        QualityWorkLease.release(lease)
+    }
+
+    @MainActor
+    func testCancellationDuringQualityEOFDoesNotAwaitUncooperativeFinish() async {
+        let setup = OptionalProviderPreparation()
+        await setup.start(analysis: nil, enhancement: nil)
+        let sink = TestQualitySpeechSink(holdPreparation: false, holdFinish: true)
+        let pass = QualitySpeechPass(pipeline: AudioPreprocessor(), language: .japanese, speech: sink,
+            optional: setup, result: { _, _, _, _, _ in }, output: { _ in }, status: { _ in })
+        pass.offer(Self.pcm(count: 4800, time: 0))
+        await sink.waitUntilPreparationStarted()
+        for _ in 0..<100 { if pass.acceptingInput { break }; await Task.yield() }
+        XCTAssertTrue(pass.acceptingInput)
+        let ending = Task { await pass.finish(aborting: false) }
+        await sink.waitUntilFinishStarted()
+        ending.cancel()
+        await ending.value
+        XCTAssertFalse(pass.acceptingInput)
+        XCTAssertEqual(pass.diagnostics.overloadStops, 0)
+        sink.releaseFinish()
+        await pass.finish(aborting: false)
+    }
+
+    @MainActor
+    func testQualityLeaseIncludesCancelledModelLoaderUntilItActuallyExits() async {
+        let setup = OptionalProviderPreparation(), gate = SuspendedPreparation()
+        await setup.start(analysis: {
+            await gate.suspend()
+            return PatternAnalysis()
+        }, enhancement: nil)
+        await gate.waitUntilStarted()
+        let sink = TestQualitySpeechSink(holdPreparation: false)
+        let pass = QualitySpeechPass(pipeline: AudioPreprocessor(), language: .japanese, speech: sink,
+            optional: setup, result: { _, _, _, _, _ in }, output: { _ in }, status: { _ in })
+        pass.offer(Self.pcm(count: 4800, time: 0))
+        await sink.waitUntilPreparationStarted()
+        await pass.finish(aborting: true)
+        let lease = UUID()
+        XCTAssertFalse(QualityWorkLease.acquire(lease), "Cancelled loader still owns native work")
+        await gate.release()
+        await pass.finish(aborting: false)
+        XCTAssertTrue(QualityWorkLease.acquire(lease))
+        QualityWorkLease.release(lease)
+    }
+
+    @MainActor
+    func testSeparationEOFConsidersFinalRowsWithoutLoadingMissingPCM() async {
+        let pass = LiveSeparationPass(modelURL: URL(fileURLWithPath: "/unavailable/Separator.mlmodelc")) { _, _ in
+            XCTFail("No PCM must not produce separated rows"); return false
+        }
+        var timeline = SpeechTimeline()
+        timeline.append((0..<3).map { .init(speechProbability: 0.9, activeSpeakers: 2,
+            start: Double($0)*0.1, end: Double($0+1)*0.1) })
+        let row = Caption(captureID: UUID(), language: .japanese, source: "最後の会話。", start: 0, end: 0.3, isFinal: true)
+        await pass.finish(rows: [row], timeline: timeline)
+        XCTAssertEqual(pass.diagnostics.skipped, 1)
+        XCTAssertEqual(pass.diagnostics.attempted, 0)
+        XCTAssertFalse(pass.diagnostics.busy)
+        XCTAssertEqual(pass.diagnostics.status, "입력 종료 · 분리 처리 종료")
+        pass.consider([row], timeline: timeline, fastBacklog: 0)
+        XCTAssertEqual(pass.diagnostics.skipped, 1, "EOF must close the pass")
+    }
+
+    @MainActor
+    func testExplicitStopPreventsEOFSeparationScheduling() async {
+        let pass = LiveSeparationPass(modelURL: URL(fileURLWithPath: "/unavailable/Separator.mlmodelc")) { _, _ in
+            XCTFail("Stopped pass must not deliver rows"); return false
+        }
+        var timeline = SpeechTimeline()
+        timeline.append((0..<3).map { .init(speechProbability: 0.9, activeSpeakers: 2,
+            start: Double($0)*0.1, end: Double($0+1)*0.1) })
+        let row = Caption(captureID: UUID(), language: .japanese, source: "最後の会話。", start: 0, end: 0.3, isFinal: true)
+        pass.stop()
+        await pass.finish(rows: [row], timeline: timeline)
+        XCTAssertEqual(pass.diagnostics.skipped, 0)
+        XCTAssertEqual(pass.diagnostics.attempted, 0)
+    }
+
+    @MainActor
+    func testSeparationLeaseBlocksRestartUntilOriginalWorkActuallyExits() {
+        let old = UUID(), next = UUID()
+        defer { SeparationWorkLease.release(old); SeparationWorkLease.release(next) }
+        XCTAssertTrue(SeparationWorkLease.acquire(old))
+        XCTAssertFalse(SeparationWorkLease.acquire(next))
+        SeparationWorkLease.release(next)
+        XCTAssertFalse(SeparationWorkLease.acquire(next))
+        SeparationWorkLease.release(old)
+        XCTAssertTrue(SeparationWorkLease.acquire(next))
+    }
+    func testSeparationStitcherRestoresSwappedLanesAndExactOverlap() throws {
+        let length = SeparationStitcher.window + SeparationStitcher.hop
+        let first = (0..<length).map { Float(sin(Double($0)*0.01))*0.1 }
+        let second = (0..<length).map { Float(cos(Double($0)*0.017))*0.1 }
+        var stitcher = SeparationStitcher()
+        try stitcher.append([Array(first.prefix(64000)), Array(second.prefix(64000))])
+        try stitcher.append([Array(second.suffix(64000)), Array(first.suffix(64000))])
+        XCTAssertEqual(stitcher.stems[0].count, length)
+        for index in 0..<length {
+            XCTAssertEqual(stitcher.stems[0][index], first[index], accuracy: 0.00001)
+            XCTAssertEqual(stitcher.stems[1][index], second[index], accuracy: 0.00001)
+        }
+    }
+
+    func testSeparationStitcherRejectsAmbiguousAndInvalidWindows() throws {
+        let same = [Float](repeating: 0.01, count: 64000)
+        var stitcher = SeparationStitcher()
+        try stitcher.append([same, same])
+        XCTAssertThrowsError(try stitcher.append([same, same]))
+        XCTAssertEqual(stitcher.stems[0].count, 64000)
+        XCTAssertThrowsError(try stitcher.append([[.nan], [.nan]]))
+    }
+
+    func testSeparationReplacementIsAtomicAndProtectedFromMixedRevision() {
+        let capture = UUID()
+        let original = Caption(captureID: capture, language: .japanese, source: "混ざった文。", translation: "기존 번역", start: 10, end: 12, isFinal: true)
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: capture, language: .japanese)
+        buffer.rows = [original]
+        let a = Caption(captureID: UUID(), language: .japanese, source: "こんにちは。", start: 10, end: 12, isFinal: true, speaker: 0)
+        let b = Caption(captureID: UUID(), language: .japanese, source: "こんばんは。", start: 10.1, end: 11.5, isFinal: true, speaker: 1)
+        XCTAssertTrue(buffer.applySeparation(original: original, separated: [a]).isEmpty)
+        XCTAssertEqual(buffer.rows[0].translation, "기존 번역")
+        let ids = buffer.applySeparation(original: original, separated: [a,b])
+        XCTAssertEqual(ids.count, 2); XCTAssertEqual(ids[0], original.id)
+        XCTAssertNotEqual(ids[0], ids[1])
+        XCTAssertEqual(buffer.rows[0].separationGroup, buffer.rows[1].separationGroup)
+        XCTAssertNotNil(buffer.rows[0].separationGroup)
+        XCTAssertTrue(buffer.rows.allSatisfy { $0.captureID == capture && $0.translation.isEmpty })
+        var mixed = original; mixed.source = "遅れて届いた混合文。"
+        XCTAssertNil(buffer.applyRevision(mixed))
+        XCTAssertTrue(buffer.applySeparation(original: original, separated: [a,b]).isEmpty)
+    }
+
+    func testSeparationRejectsStaleClearAndOutOfRangeResults() {
+        let capture = UUID()
+        let original = Caption(captureID: capture, language: .japanese, source: "元の文。", start: 0, end: 1, isFinal: true)
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: capture, language: .japanese)
+        buffer.rows = [original]
+        var a = original; a.source = "最初。"; a.speaker = 0
+        var b = original; b.source = "次。"; b.speaker = 1; b.end = 2
+        XCTAssertTrue(buffer.applySeparation(original: original, separated: [a,b]).isEmpty)
+        b.end = 1; buffer.rows[0].source = "変更後。"
+        XCTAssertTrue(buffer.applySeparation(original: original, separated: [a,b]).isEmpty)
+        buffer.clearDisplay(through: 1)
+        XCTAssertTrue(buffer.applySeparation(original: original, separated: [a,b]).isEmpty)
+        XCTAssertTrue(buffer.rows.isEmpty)
+    }
+
+    @MainActor
+    func testLiveSeparationRequiresCoveredOverlapAndExcludesThreeSpeakers() {
+        var timeline = SpeechTimeline()
+        timeline.append((0..<3).map { .init(speechProbability: 0.9, activeSpeakers: 2,
+            start: Double($0)*0.1, end: Double($0+1)*0.1) })
+        var row = Caption(captureID: UUID(), language: .japanese, source: "会話。", start: 0, end: 0.3, isFinal: true)
+        XCTAssertTrue(LiveSeparationPass.eligible(row, timeline: timeline))
+        timeline.append([.init(speechProbability: 0.9, activeSpeakers: 3, start: 0.3, end: 0.4)])
+        row.end = 0.4
+        XCTAssertFalse(LiveSeparationPass.eligible(row, timeline: timeline))
+        row.end = 0.5
+        XCTAssertFalse(LiveSeparationPass.eligible(row, timeline: timeline))
+        row.end = 0.3; row.separationGroup = UUID()
+        XCTAssertFalse(LiveSeparationPass.eligible(row, timeline: timeline))
+    }
+
+    @MainActor
+    func testMissingSeparationModelNeverClaimsWorkOrDeliversRows() {
+        let pass = LiveSeparationPass(modelURL: nil) { _, _ in
+            XCTFail("Missing models must not produce separation output"); return false
+        }
+        var timeline = SpeechTimeline()
+        timeline.append((0..<3).map { .init(speechProbability: 0.9, activeSpeakers: 2,
+            start: Double($0)*0.1, end: Double($0+1)*0.1) })
+        let row = Caption(captureID: UUID(), language: .japanese, source: "会話。", start: 0, end: 0.3, isFinal: true)
+        pass.consider([row], timeline: timeline, fastBacklog: 0)
+        XCTAssertEqual(pass.diagnostics.attempted, 0)
+        XCTAssertFalse(pass.diagnostics.busy)
+        XCTAssertEqual(pass.diagnostics.completed, 0)
+        pass.clear(); pass.stop()
+    }
+
+    func testSeparationPCMWindowIsBoundedAndDoesNotBridgeGaps() {
+        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!
+        func chunk(_ time: Double) -> PCMChunk {
+            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 480)!
+            buffer.frameLength = 480
+            return PCMChunk(buffer: buffer, time: time)
+        }
+        var ring = SeparationAudioWindow()
+        ring.append(chunk(0)); ring.append(chunk(0.02))
+        XCTAssertNil(ring.covering(start: 0, end: 0.03))
+        ring = SeparationAudioWindow()
+        for index in 0..<3500 { ring.append(chunk(Double(index)/100)) }
+        XCTAssertLessThanOrEqual(ring.count, 3202)
+        XCTAssertNil(ring.covering(start: 0, end: 1))
+        XCTAssertNotNil(ring.covering(start: 34, end: 35))
+        XCTAssertNil(ring.covering(start: 3, end: 35))
+    }
+
+    func testStemLevelingBoostsQuietSpeechButNotNoiseOrOtherStem() throws {
+        let quiet = [Float](repeating: 0.01, count: 4096)
+        let speech = try StemLeveling.process(quiet, probabilities: [0.9])
+        let noise = try StemLeveling.process(quiet, probabilities: [0.1])
+        XCTAssertGreaterThan(speech.last!, quiet.last! * 3)
+        XCTAssertEqual(noise, quiet)
+        XCTAssertEqual(speech.count, quiet.count)
+    }
+
+    func testStemLevelingDoesNotCarrySpeechGainIntoNoiseAndPreservesShortTail() throws {
+        let samples = [Float](repeating: 0.01, count: 4096 + 37)
+        let result = try StemLeveling.process(samples, probabilities: [0.9, 0.1])
+        XCTAssertEqual(result.count, samples.count)
+        XCTAssertEqual(Array(result.suffix(37)), Array(samples.suffix(37)))
+        XCTAssertTrue(result.allSatisfy { $0.isFinite && abs($0) <= 0.98 })
+    }
+
+    func testStemLevelingRejectsMissingMisalignedAndInvalidVAD() {
+        let samples = [Float](repeating: 0.01, count: 4097)
+        XCTAssertThrowsError(try StemLeveling.process(samples, probabilities: []))
+        XCTAssertThrowsError(try StemLeveling.process(samples, probabilities: [0.9]))
+        XCTAssertThrowsError(try StemLeveling.process(samples, probabilities: [0.9, .nan]))
+        XCTAssertThrowsError(try StemLeveling.process(samples, probabilities: [0.9, 1.1]))
+        XCTAssertThrowsError(try StemLeveling.process([.infinity], probabilities: [0.9]))
+    }
+
+    func testOverlapGateRejectsInvalidConfidenceAndSaturates() {
+        var gate = OverlapGate()
+        for _ in 0..<100 { _ = gate.observe(activeSpeakers: 2, probability: 0.9) }
+        XCTAssertEqual(gate.consecutive, 3)
+        XCTAssertFalse(gate.observe(activeSpeakers: 2, probability: .infinity))
+        XCTAssertFalse(gate.observe(activeSpeakers: 2, probability: 1.1))
+        XCTAssertEqual(gate.consecutive, 0)
+    }
+
+    func testSudachiPreferenceDefaultsToCAndPersistsEachSupportedMode() {
+        let suite = "JP-Live.Tests.SplitMode." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertEqual(SudachiSplitMode.stored(in: defaults), .c)
+        for mode in SudachiSplitMode.allCases {
+            defaults.set(mode.rawValue, forKey: SudachiSplitMode.preferenceKey)
+            XCTAssertEqual(SudachiSplitMode.stored(in: defaults), mode)
+        }
+        defaults.set("invalid", forKey: SudachiSplitMode.preferenceKey)
+        XCTAssertEqual(SudachiSplitMode.stored(in: defaults), .c)
+        XCTAssertEqual(SudachiSplitMode.allCases.map(\.bridgeValue), [0, 1, 2])
+    }
+
+    func testMorphologyModesPreserveUnicodeSourceAndRanges() async throws {
+        let worker = MorphologyWorker()
+        let source = "🎮東京都でゲームをします。"
+        for mode in SudachiSplitMode.allCases {
+            let result = try await worker.analyze(source, language: .japanese, mode: mode)
+            XCTAssertEqual(result.tokens.map(\.surface).joined(), source)
+            var cursor = 0
+            for token in result.tokens {
+                XCTAssertEqual(token.start, cursor)
+                let range = try XCTUnwrap(Range(NSRange(location: token.start, length: token.end-token.start), in: source))
+                XCTAssertEqual(String(source[range]), token.surface)
+                cursor = token.end
+            }
+            XCTAssertEqual(cursor, source.utf16.count)
+            if !LocalTokenizer.nativeBridgeLinked {
+                XCTAssertNotNil(result.warning)
+                XCTAssertEqual(result.engine, "Apple NaturalLanguage")
+            }
+        }
+    }
+    #if PHASE2
+    func testRequiredPhase2NativeSudachiLoadsBundledDictionaryAndSplitsABC() throws {
+        XCTAssertTrue(LocalTokenizer.nativeBridgeLinked, "Phase 2 must link SudachiBridge; Apple fallback is not a native integration pass")
+        let a = try LocalTokenizer.nativeTokens("国家公務員", mode: .a)
+        let b = try LocalTokenizer.nativeTokens("国家公務員", mode: .b)
+        let c = try LocalTokenizer.nativeTokens("国家公務員", mode: .c)
+        XCTAssertGreaterThanOrEqual(a.count, b.count)
+        XCTAssertGreaterThanOrEqual(b.count, c.count)
+        XCTAssertGreaterThan(a.count, c.count)
+        for tokens in [a, b, c] { XCTAssertEqual(tokens.map(\.surface).joined(), "国家公務員") }
+    }
+    #endif
     #if PHASE2
     @MainActor
     func testDeviceValidationMetricsPassContinuousCaptureThroughAnalyzerInput() {
@@ -240,6 +622,97 @@ final class CoreTests: XCTestCase {
         XCTAssertFalse(gate.observe(activeSpeakers: 3, probability: 0.9))
         XCTAssertFalse(gate.observe(activeSpeakers: nil, probability: 0.9))
     }
+
+    func testDefensiveOverlappingFinalCannotDuplicateStableText() {
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
+        _ = buffer.receive("今日はも", final: true, start: 0, end: 1, speaker: nil, now: 0)
+        _ = buffer.receive("今日は晴れも", final: true, start: 0, end: 2, speaker: nil, now: 1)
+        XCTAssertEqual(buffer.rows.map(\.source), ["今日は晴れも"])
+        XCTAssertEqual(buffer.rows.count, 1)
+        XCTAssertFalse(buffer.rows[0].isFinal)
+    }
+
+    func testPartialOverlappingFinalCannotDuplicateOrSurgicallyRewriteStableText() {
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
+        _ = buffer.receive("今日は", final: true, start: 0, end: 1, speaker: nil, now: 0)
+        _ = buffer.receive("は晴れ", final: true, start: 0.5, end: 1.5, speaker: nil, now: 1)
+        XCTAssertEqual(buffer.rows.map(\.source), ["今日は"])
+    }
+
+    func testLateOverlappingFinalCannotResurrectCommittedHistory() {
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
+        _ = buffer.receive("今日は晴れ。", final: true, start: 0, end: 1, speaker: nil, now: 0)
+        XCTAssertTrue(buffer.rows[0].isFinal)
+        _ = buffer.receive("今日は雨。次です。", final: true, start: 0, end: 2, speaker: nil, now: 1)
+        XCTAssertEqual(buffer.rows.map(\.source), ["今日は晴れ。"])
+    }
+
+    func testQualityLexicalConflictKeepsPrimary() {
+        let capture = UUID()
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: capture, language: .japanese)
+        _ = buffer.receive("今日は晴れです。", final: true, start: 0, end: 1, speaker: nil, now: 0)
+        let quality = Caption(captureID: capture, language: .japanese,
+                              source: "今日は雨です。", start: 0, end: 1, isFinal: true)
+        if case .rejected = buffer.resolveRevision(quality) {} else { XCTFail("lexical conflict must keep primary") }
+        XCTAssertEqual(buffer.rows[0].source, "今日は晴れです。")
+    }
+
+    func testQualityPunctuationConflictStillKeepsPrimary() {
+        let capture = UUID()
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: capture, language: .japanese)
+        _ = buffer.receive("今日は晴れです。", final: true, start: 0, end: 1, speaker: nil, now: 0)
+        let quality = Caption(captureID: capture, language: .japanese,
+                              source: "今日は晴れです！", start: 0, end: 1, isFinal: true)
+        if case .rejected = buffer.resolveRevision(quality) {} else { XCTFail("Primary punctuation must win") }
+        XCTAssertEqual(buffer.rows[0].source, "今日は晴れです。")
+    }
+
+    func testQualityPunctuationHeuristicCannotChangeEnglishMeaning() {
+        let capture = UUID()
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: capture, language: .english)
+        _ = buffer.receive("well.", final: true, start: 0, end: 1, speaker: nil, now: 0)
+        let quality = Caption(captureID: capture, language: .english,
+                              source: "we'll.", start: 0, end: 1, isFinal: true)
+        if case .rejected = buffer.resolveRevision(quality) {} else { XCTFail("Primary text must win") }
+        XCTAssertEqual(buffer.rows[0].source, "well.")
+    }
+
+    func testFinalizationFrontierPromotesUnchangedVolatileWithoutReissue() {
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
+        _ = buffer.receive("今日は", final: false, start: 0, end: 1, speaker: nil, now: 0, finalizedThrough: 0)
+        XCTAssertEqual(buffer.rows.map(\.source), ["今日は"])
+        // Apple may finalize the previous volatile result without re-emitting that same
+        // text. A later range advancing the frontier must preserve, not delete, it.
+        _ = buffer.receive("晴れ", final: false, start: 1, end: 1.5, speaker: nil, now: 0.1, finalizedThrough: 1)
+        XCTAssertEqual(buffer.rows.map(\.source), ["今日は晴れ"])
+    }
+
+    func testFinalizationPromotionCanCommitCompletedSentence() {
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
+        _ = buffer.receive("今日は晴れ。", final: false, start: 0, end: 1, speaker: nil, now: 0, finalizedThrough: 0)
+        let ready = buffer.receive("次です", final: false, start: 1, end: 1.6, speaker: nil, now: 0.1, finalizedThrough: 1)
+        XCTAssertEqual(ready.count, 1)
+        XCTAssertEqual(buffer.rows.map(\.source), ["今日は晴れ。", "次です"])
+        XCTAssertTrue(buffer.rows[0].isFinal)
+        XCTAssertFalse(buffer.rows[1].isFinal)
+    }
+
+    func testEmptyVolatileResultRevokesMatchingTentativeText() {
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
+        _ = buffer.receive("も", final: false, start: 0, end: 0.3, speaker: nil, now: 0, finalizedThrough: 0)
+        XCTAssertEqual(buffer.rows.map(\.source), ["も"])
+        _ = buffer.receive("", final: false, start: 0, end: 0.3, speaker: nil, now: 0.1, finalizedThrough: 0)
+        XCTAssertTrue(buffer.rows.isEmpty)
+    }
+
+    func testFinalizationFrontierDoesNotPrematurelyPromoteLiveVolatileTail() {
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: UUID(), language: .japanese)
+        _ = buffer.receive("今日は", final: true, start: 0, end: 1, speaker: nil, now: 0, finalizedThrough: 1)
+        _ = buffer.receive("も", final: false, start: 1, end: 1.3, speaker: nil, now: 0.1, finalizedThrough: 1.1)
+        XCTAssertEqual(buffer.rows.map(\.source), ["今日はも"])
+        XCTAssertFalse(buffer.rows[0].isFinal)
+    }
+
     func testStableRowIdentityFromVolatileToFinal() {
         var buffer = TranscriptBuffer()
         buffer.begin(captureID: UUID(), language: .japanese)
@@ -543,20 +1016,19 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(buffer.rows.count, 1)
         XCTAssertFalse(buffer.rows[0].isFinal)
     }
-    func testQualityRevisionUpdatesSameCaptionAndCanMergeOversplitRows() {
+    func testQualityRevisionCannotMergePrimaryRowsUntilConsensusResolverExists() {
         let capture = UUID()
         var buffer = TranscriptBuffer(); buffer.begin(captureID: capture, language: .japanese)
         _ = buffer.receive("これはテストです。", final: true, start: 0, end: 1, speaker: nil, now: 0)
         _ = buffer.receive("次です。", final: true, start: 1, end: 2, speaker: nil, now: 1)
         XCTAssertEqual(buffer.rows.count, 2)
-        let kept = buffer.rows[0].id
+        let originalIDs = buffer.rows.map(\.id)
         let revised = Caption(captureID: capture, language: .japanese,
             source: "これはテストです。次です。", start: 0, end: 2, isFinal: true)
-        let effect = buffer.applyRevision(revised)
-        XCTAssertEqual(effect?.updatedID, kept)
-        XCTAssertEqual(buffer.rows.count, 1)
-        XCTAssertEqual(buffer.rows[0].source, revised.source)
-        XCTAssertEqual(buffer.rows[0].id, kept)
+        XCTAssertNil(buffer.applyRevision(revised))
+        XCTAssertEqual(buffer.rows.count, 2)
+        XCTAssertEqual(buffer.rows.map(\.source), ["これはテストです。", "次です。"])
+        XCTAssertEqual(buffer.rows.map(\.id), originalIDs)
     }
 
     func testLateSpeakerTimelineUpdatesVisibleCaptionWithoutHoldingSTT() {
@@ -567,6 +1039,188 @@ final class CoreTests: XCTestCase {
         let changed = buffer.applySpeakerTimeline(timeline)
         XCTAssertEqual(changed, [buffer.rows[0].id])
         XCTAssertEqual(buffer.rows[0].speaker, 2)
+    }
+
+    func testPartialQualityRevisionCannotEraseTheRestOfALongerCaption() {
+        let capture = UUID()
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: capture, language: .japanese)
+        _ = buffer.receive("昨日から今日までずっと勉強していました。", final: true,
+                           start: 0, end: 10, speaker: nil, now: 10)
+        let original = buffer.rows[0]
+        let short = Caption(captureID: capture, language: .japanese,
+                            source: "今日まで。", start: 4, end: 5, isFinal: true)
+        XCTAssertNil(buffer.applyRevision(short))
+        XCTAssertEqual(buffer.rows.count, 1)
+        XCTAssertEqual(buffer.rows[0].source, original.source)
+        XCTAssertEqual(buffer.rows[0].id, original.id)
+    }
+
+    func testQualityRevisionDoesNotInventCoverageOutsideExistingRowsOrAcrossAGap() {
+        let capture = UUID()
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: capture, language: .japanese)
+        _ = buffer.receive("最初です。", final: true, start: 0, end: 1, speaker: nil, now: 1)
+        let larger = Caption(captureID: capture, language: .japanese,
+                             source: "最初から最後です。", start: 0, end: 3, isFinal: true)
+        XCTAssertNil(buffer.applyRevision(larger))
+        _ = buffer.receive("最後です。", final: true, start: 2, end: 3, speaker: nil, now: 3)
+        XCTAssertNil(buffer.applyRevision(larger))
+        XCTAssertEqual(buffer.rows.count, 2)
+    }
+
+    func testQualityRevisionRejectsNonfiniteTime() {
+        let capture = UUID()
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: capture, language: .japanese)
+        _ = buffer.receive("元の文章。", final: true, start: 0, end: 1, speaker: nil, now: 1)
+        for end in [Double.infinity, Double.nan] {
+            XCTAssertNil(buffer.applyRevision(Caption(captureID: capture, language: .japanese,
+                source: "違う文章。", start: 0, end: end, isFinal: true)))
+        }
+        XCTAssertEqual(buffer.rows[0].source, "元の文章。")
+    }
+
+    func testClearRejectsDelayedAndCrossingPhrasesThenResumesAndNewCaptureResetsTime() {
+        let capture = UUID()
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: capture, language: .japanese)
+        buffer.clearDisplay(through: 5)
+        _ = buffer.receive("古い仮説", final: false, start: 1, end: 4, speaker: nil, now: 6)
+        _ = buffer.receive("境界をまたぐ文章。", final: true, start: 4, end: 6, speaker: nil, now: 7)
+        XCTAssertTrue(buffer.rows.isEmpty)
+        _ = buffer.receive("新しい文章。", final: true, start: 6, end: 7, speaker: nil, now: 8)
+        XCTAssertEqual(buffer.rows.map(\.source), ["新しい文章。"])
+        let next = UUID()
+        buffer.begin(captureID: next, language: .japanese)
+        _ = buffer.receive("次の録音。", final: true, start: 0, end: 1, speaker: nil, now: 9)
+        XCTAssertEqual(buffer.rows.last?.captureID, next)
+        XCTAssertEqual(buffer.rows.last?.source, "次の録音。")
+    }
+
+    func testSpeakerTimelineDoesNotRelabelPreviousCaptureAtSameAudioTime() {
+        let previous = UUID()
+        var buffer = TranscriptBuffer(); buffer.begin(captureID: previous, language: .japanese)
+        _ = buffer.receive("前回です。", final: true, start: 0, end: 1, speaker: 1, now: 1)
+        buffer.begin(captureID: UUID(), language: .japanese)
+        _ = buffer.receive("今回です。", final: true, start: 0, end: 1, speaker: nil, now: 2)
+        var timeline = SpeechTimeline()
+        timeline.append([SpeechDecision(speechProbability: 1, activeSpeakers: 1,
+                                       start: 0, end: 1, speakerSlot: 2)])
+        _ = buffer.applySpeakerTimeline(timeline)
+        XCTAssertEqual(buffer.rows[0].speaker, 1)
+        XCTAssertEqual(buffer.rows[1].speaker, 2)
+    }
+
+    func testQualityBacklogBoundsAudioIncludingInFlightWork() {
+        var budget = QualityAudioBudget()
+        XCTAssertTrue(budget.reserve(duration: 2))
+        XCTAssertTrue(budget.reserve(duration: 1))
+        XCTAssertFalse(budget.reserve(duration: 0.01))
+        XCTAssertEqual(budget.count, 2)
+        budget.release(duration: 2)
+        XCTAssertTrue(budget.reserve(duration: 1))
+        XCTAssertFalse(budget.reserve(duration: .nan))
+        XCTAssertFalse(budget.reserve(duration: -.infinity))
+        XCTAssertFalse(budget.reserve(duration: 0))
+    }
+
+    func testQualityBacklogAlsoBoundsTinyBuffers() {
+        var budget = QualityAudioBudget()
+        for _ in 0..<256 { XCTAssertTrue(budget.reserve(duration: 1.0/48000)) }
+        XCTAssertFalse(budget.reserve(duration: 1.0/48000))
+        budget.release(duration: 1.0/48000)
+        XCTAssertTrue(budget.reserve(duration: 1.0/48000))
+    }
+
+    @MainActor
+    func testStoppingQualityPreparationDoesNotWaitForLoaderOrDeliverLateResults() async {
+        let sink = TestQualitySpeechSink(holdPreparation: true)
+        let setup = OptionalProviderPreparation()
+        await setup.start(analysis: nil, enhancement: nil)
+        var resultCount = 0
+        let pass = QualitySpeechPass(pipeline: AudioPreprocessor(analysisPolicy: .qualityRevision),
+            language: .japanese, speech: sink, optional: setup,
+            result: { _, _, _, _, _ in resultCount += 1 }, output: { _ in }, status: { _ in })
+        pass.offer(Self.pcm(count: 4800, time: 0))
+        await sink.waitUntilPreparationStarted()
+        for index in 1...100 { pass.offer(Self.pcm(count: 4800, time: Double(index)/10)) }
+        XCTAssertEqual(pass.diagnostics.backlog, 0)
+        XCTAssertEqual(pass.diagnostics.skippedChunks, 101)
+        // Deliberately leave preparation suspended: Stop must return before release.
+        await pass.finish(aborting: true)
+        sink.emitResult()
+        XCTAssertEqual(resultCount, 0)
+        sink.releasePreparation()
+        await pass.finish(aborting: false)
+        XCTAssertEqual(sink.appendCount, 0)
+        XCTAssertTrue(sink.abortCount > 0)
+    }
+
+    @MainActor
+    func testQualityQueueOverflowDisablesOnlyThatPassAndRejectsLateDelivery() async {
+        let sink = TestQualitySpeechSink(holdPreparation: false)
+        let setup = OptionalProviderPreparation()
+        await setup.start(analysis: nil, enhancement: nil)
+        var resultCount = 0, lastStatus = ""
+        let pass = QualitySpeechPass(pipeline: AudioPreprocessor(analysisPolicy: .qualityRevision),
+            language: .japanese, speech: sink, optional: setup,
+            result: { _, _, _, _, _ in resultCount += 1 }, output: { _ in }, status: { lastStatus = $0 })
+        pass.offer(Self.pcm(count: 4800, time: 0))
+        await sink.waitUntilPreparationStarted()
+        for _ in 0..<100 {
+            if pass.acceptingInput { break }
+            await Task.yield()
+        }
+        XCTAssertTrue(pass.acceptingInput)
+        // Simulate a producer burst while the optional worker cannot consume.
+        for index in 1...40 { pass.offer(Self.pcm(count: 4800, time: Double(index)/10)) }
+        XCTAssertFalse(pass.acceptingInput)
+        XCTAssertEqual(pass.diagnostics.overloadStops, 1)
+        XCTAssertLessThanOrEqual(pass.diagnostics.peakBacklog, 3)
+        XCTAssertTrue(lastStatus.contains("빠른 STT 유지"))
+        sink.emitResult()
+        XCTAssertEqual(resultCount, 0)
+        await pass.finish(aborting: false)
+        XCTAssertTrue(sink.abortCount > 0)
+    }
+
+    func testLiveInputBacklogCountsInFlightAudioAndReturnsToZero() {
+        let progress = AudioInputProgress()
+        let first = Self.pcm(count: 4800, time: 7)
+        let second = Self.pcm(count: 4800, time: 7.1)
+        _ = progress.captured(first); _ = progress.captured(second)
+        XCTAssertEqual(progress.snapshot().pendingAudio, 0.2, accuracy: 0.000001)
+        XCTAssertEqual(progress.snapshot().sourceBacklog, 0.2, accuracy: 0.000001)
+        progress.processed(first)
+        XCTAssertEqual(progress.snapshot().pendingChunks, 1)
+        XCTAssertEqual(progress.snapshot().pendingAudio, 0.1, accuracy: 0.000001)
+        progress.processed(second)
+        XCTAssertEqual(progress.snapshot().pendingChunks, 0)
+        XCTAssertEqual(progress.snapshot().sourceBacklog, 0, accuracy: 0.000001)
+        XCTAssertEqual(progress.snapshot().pendingAudio, 0, accuracy: 0.000001)
+        XCTAssertEqual(progress.snapshot().peakPendingAudio, 0.2, accuracy: 0.000001)
+    }
+
+    func testRealSourceGapIsNotCountedAsQueuedPCM() {
+        let progress = AudioInputProgress()
+        let first = Self.pcm(count: 4800, time: 0)
+        let afterGap = Self.pcm(count: 4800, time: 30)
+        _ = progress.captured(first); progress.processed(first)
+        _ = progress.captured(afterGap)
+        XCTAssertEqual(progress.snapshot().pendingAudio, 0.1, accuracy: 0.000001)
+        XCTAssertGreaterThan(progress.snapshot().sourceBacklog, 29)
+        progress.processed(afterGap)
+        XCTAssertEqual(progress.snapshot().sourceBacklog, 0, accuracy: 0.000001)
+    }
+
+    func testRetainedTimelineLookupStillRejectsGapsAndKeepsSpeakerOrder() {
+        var timeline = SpeechTimeline()
+        for index in 0..<1000 {
+            timeline.append([.init(speechProbability: 1, activeSpeakers: 1,
+                                  start: Double(index), end: Double(index)+0.9, speakerSlot: index%2)])
+        }
+        XCTAssertLessThan(timeline.frames.count, 123)
+        XCTAssertEqual(timeline.speaker(start: 998, end: 998.5), 0)
+        XCTAssertEqual(timeline.speaker(start: 999, end: 999.5), 1)
+        XCTAssertNil(timeline.covering(start: 998.8, end: 999.1))
+        XCTAssertNil(timeline.covering(start: 1, end: 1.5))
     }
 
     func testClearDisplayResetsVisibleChunkWithoutEndingCapture() {
@@ -864,6 +1518,50 @@ final class CoreTests: XCTestCase {
         for index in 0..<count { buffer.floatChannelData![0][index] = amplitude }
         return PCMChunk(buffer: buffer, time: time)
     }
+}
+
+@MainActor
+private final class TestQualitySpeechSink: QualitySpeechSink {
+    let holdPreparation: Bool
+    let holdFinish: Bool
+    private var finishReleased = false
+    private var finishStarted = false
+    private var finishGate: CheckedContinuation<Void, Never>?
+    private var finishWaiters: [CheckedContinuation<Void, Never>] = []
+    private var prepared = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var gate: CheckedContinuation<Void, Never>?
+    private var result: ((String, Bool, Double, Double, Double?) -> Void)?
+    private(set) var appendCount = 0
+    private(set) var abortCount = 0
+    init(holdPreparation: Bool, holdFinish: Bool = false) {
+        self.holdPreparation = holdPreparation; self.holdFinish = holdFinish
+    }
+    func prepareForQuality(language: SourceLanguage,
+                           result: @escaping (String, Bool, Double, Double, Double?) -> Void,
+                           failure: @escaping (String) -> Void) async throws {
+        self.result = result; prepared = true
+        for waiter in waiters { waiter.resume() }; waiters = []
+        if holdPreparation { await withCheckedContinuation { gate = $0 } }
+    }
+    func waitUntilPreparationStarted() async {
+        if prepared { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    func releasePreparation() { gate?.resume(); gate = nil }
+    func emitResult() { result?("遅れて届いた結果。", true, 0, 1, 1) }
+    func append(_ chunk: PCMChunk) { appendCount += 1 }
+    func finish(aborting: Bool) async {
+        if aborting { abortCount += 1 }
+        finishStarted = true
+        for waiter in finishWaiters { waiter.resume() }; finishWaiters = []
+        if holdFinish && !finishReleased { await withCheckedContinuation { finishGate = $0 } }
+    }
+    func waitUntilFinishStarted() async {
+        if finishStarted { return }
+        await withCheckedContinuation { finishWaiters.append($0) }
+    }
+    func releaseFinish() { finishReleased = true; finishGate?.resume(); finishGate = nil }
 }
 
 private actor SuspendedPreparation {

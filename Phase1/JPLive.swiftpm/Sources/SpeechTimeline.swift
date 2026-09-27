@@ -34,7 +34,16 @@ struct SpeechTimeline: Sendable {
         guard start.isFinite, end.isFinite, end > start else { return nil }
         var cursor = start
         var matches: [SpeechDecision] = []
-        for frame in frames where frame.end > start+tolerance && frame.start < end-tolerance {
+        // Frames are appended in time order. Skip old history in logarithmic time;
+        // late speaker annotation must not rescan 120 seconds for every caption.
+        var low = 0, high = frames.count
+        while low < high {
+            let middle = low + (high-low)/2
+            if frames[middle].end <= start+tolerance { low = middle+1 } else { high = middle }
+        }
+        for index in low..<frames.count {
+            let frame = frames[index]
+            if frame.start >= end-tolerance { break }
             if frame.start > cursor+tolerance { return nil }
             matches.append(frame); cursor = max(cursor, frame.end)
             if cursor >= end-tolerance { return matches }
@@ -80,6 +89,12 @@ enum SpeakerGutterHint: String, Codable, Sendable {
 // Presentation-only, per-capture state. At most one recent primary and one short
 // auxiliary candidate/track; never a growing database of people or raw-slot colors.
 struct SoftSpeakerMapper {
+    mutating func hint(for row: Caption) -> SpeakerGutterHint {
+        // Separator lane 0/1 is local to its interval, not a diarizer identity.
+        // Preserve its existing pair colors without feeding it into track state.
+        if row.separationGroup != nil { return row.gutterHint }
+        return hint(slot: row.speaker, start: row.start, end: row.end)
+    }
     private struct Track {
         var slot: Int
         var tint: SpeakerGutterHint

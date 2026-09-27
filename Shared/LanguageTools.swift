@@ -5,18 +5,62 @@ import NaturalLanguage
 import SudachiBridge
 #endif
 
+enum SudachiSplitMode: String, CaseIterable, Codable, Sendable, Identifiable {
+    case a = "A", b = "B", c = "C"
+    var id: String { rawValue }
+    static let preferenceKey = "jpTranslatorSudachiSplitMode"
+    static func stored(in defaults: UserDefaults = .standard) -> Self {
+        Self(rawValue: defaults.string(forKey: preferenceKey) ?? "C") ?? .c
+    }
+    var bridgeValue: Int32 { self == .a ? 0 : (self == .b ? 1 : 2) }
+}
+
+struct MorphologyResult: Sendable {
+    var tokens: [WordToken]
+    var engine: String
+    var warning: String?
+}
+
 enum LocalTokenizer {
+    static var nativeBridgeLinked: Bool {
+        #if canImport(SudachiBridge)
+        return true
+        #else
+        return false
+        #endif
+    }
+    static func nativeTokens(_ source: String, mode: SudachiSplitMode) throws -> [WordToken] {
+        #if canImport(SudachiBridge)
+        return try SudachiRuntime.analyze(source, mode: mode)
+        #else
+        throw AppFailure.message("Sudachi native framework가 앱에 연결되지 않았습니다.")
+        #endif
+    }
     static var engineName: String {
         #if canImport(SudachiBridge)
-        return "Sudachi / Apple NaturalLanguage"
+        return "Sudachi 연결 · 분석 실패 시 Apple 분석 사용"
         #else
         return "Apple 형태소 분석 (Sudachi 미연결)"
         #endif
     }
-    static func tokens(_ source: String, language: SourceLanguage) -> [WordToken] {
+    static func tokens(_ source: String, language: SourceLanguage, mode: SudachiSplitMode = .c) -> [WordToken] {
+        analyze(source, language: language, mode: mode).tokens
+    }
+    static func analyze(_ source: String, language: SourceLanguage, mode: SudachiSplitMode) -> MorphologyResult {
+        var warning: String?
         #if canImport(SudachiBridge)
-        if language == .japanese, let result = SudachiRuntime.analyze(source) { return result }
+        if language == .japanese {
+            do {
+                return MorphologyResult(tokens: try nativeTokens(source, mode: mode),
+                                        engine: "Sudachi " + mode.rawValue)
+            } catch { warning = "Sudachi 분석 실패 · Apple 분석 사용: " + error.localizedDescription }
+        }
+        #else
+        if language == .japanese { warning = "Sudachi 미연결 · Apple 분석에서는 A/B/C 분할이 적용되지 않습니다." }
         #endif
+        return MorphologyResult(tokens: appleTokens(source, language: language), engine: "Apple NaturalLanguage", warning: warning)
+    }
+    private static func appleTokens(_ source: String, language: SourceLanguage) -> [WordToken] {
         let tagger = NLTagger(tagSchemes: [.lemma])
         tagger.string = source
         tagger.setLanguage(language == .japanese ? .japanese : .english, range: source.startIndex..<source.endIndex)
@@ -67,14 +111,17 @@ enum LocalTokenizer {
 // Serialize dictionary work away from MainActor. Pending volatile work is cancellable
 // before analysis starts; the UI applies only a matching source/request afterwards.
 actor MorphologyWorker {
-    private struct Key: Hashable { var source: String; var language: SourceLanguage }
-    private var cache: [Key: [WordToken]] = [:]
+    private struct Key: Hashable { var source: String; var language: SourceLanguage; var mode: SudachiSplitMode }
+    private var cache: [Key: MorphologyResult] = [:]
     private var order: [Key] = []
-    func tokens(_ source: String, language: SourceLanguage) throws -> [WordToken] {
+    func tokens(_ source: String, language: SourceLanguage, mode: SudachiSplitMode = .c) throws -> [WordToken] {
+        try analyze(source, language: language, mode: mode).tokens
+    }
+    func analyze(_ source: String, language: SourceLanguage, mode: SudachiSplitMode) throws -> MorphologyResult {
         try Task.checkCancellation()
-        let key = Key(source: source, language: language)
+        let key = Key(source: source, language: language, mode: language == .japanese ? mode : .c)
         if let hit = cache[key] { return hit }
-        let value = LocalTokenizer.tokens(source, language: language)
+        let value = LocalTokenizer.analyze(source, language: language, mode: key.mode)
         try Task.checkCancellation()
         // Avoid caching an unbounded long transcript or dictionary results forever.
         if source.utf16.count <= 1000 {

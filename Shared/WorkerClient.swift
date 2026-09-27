@@ -95,8 +95,10 @@ actor WorkerClient {
         }
         throw AppFailure.message("인증 갱신에 실패했습니다.")
     }
-    func translate(_ text: String, language: SourceLanguage) async throws -> String {
-        let data = try await request("/run/translate", body: ["text":text,"src":language.code,"tgt":"KO","target":"KO"])
+    func translate(_ text: String, language: SourceLanguage, context: String? = nil) async throws -> String {
+        var body: [String: Any] = ["text":text,"src":language.code,"tgt":"KO","target":"KO"]
+        if let context, !context.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { body["context"] = context }
+        let data = try await request("/run/translate", body: body)
         struct Result: Decodable { var translation: String }
         return try JSONDecoder().decode(Result.self, from: data).translation
     }

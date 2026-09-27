@@ -45,12 +45,9 @@ final class StreamingPCMConverter {
     private var sourceInputFrames: Int64 = 0
     private var leadingOutputFramesRemaining: Int64 = 0
     private var outputRateRatio: Double = 1
-    private var diagnosticInputFrames: Int64 = 0
-    private let diagnosticLabel: String?
     private var closed = false
 
-    init(from input: AVAudioFormat, to output: AVAudioFormat, origin: Double, diagnosticLabel: String? = nil) throws {
-        self.diagnosticLabel = diagnosticLabel
+    init(from input: AVAudioFormat, to output: AVAudioFormat, origin: Double) throws {
         inputFormat = input; outputFormat = output; self.origin = origin
         guard input.sampleRate > 0, output.sampleRate > 0, origin.isFinite else {
             throw AppFailure.message("오디오 변환 형식 오류")
@@ -69,7 +66,6 @@ final class StreamingPCMConverter {
             leadingOutputFramesRemaining = Int64(ceil(Double(value.primeInfo.leadingFrames) * outputRateRatio))
             converter = value
         }
-        trace("init")
     }
     func convert(_ input: AVAudioPCMBuffer) throws -> [PCMChunk] {
         guard !closed, input.format == inputFormat else {
@@ -79,24 +75,13 @@ final class StreamingPCMConverter {
         let (nextInputFrames, overflow) = sourceInputFrames.addingReportingOverflow(Int64(input.frameLength))
         guard !overflow else { throw AppFailure.message("오디오 입력 샘플 수 범위 초과") }
         sourceInputFrames = nextInputFrames
-        if diagnosticLabel != nil { diagnosticInputFrames += Int64(input.frameLength) }
         if converter == nil { return [stamp(input)] }
         return try drain(input)
     }
     func flush() throws -> [PCMChunk] {
         guard !closed else { return [] }
         closed = true
-        let before = outputFrames
-        trace("flush.before", outputBeforeFlush: before)
-        let result = converter == nil ? [] : try drain(nil)
-        trace("flush.after", outputBeforeFlush: before)
-        return result
-    }
-    // Observation only: no converter configuration, audio, timing, or test threshold changes.
-    private func trace(_ event: String, outputBeforeFlush: Int64? = nil) {
-        guard let diagnosticLabel, let converter else { return }
-        let before = outputBeforeFlush ?? outputFrames
-        print("[PCM_TRACE] case=\(diagnosticLabel) event=\(event) inputRate=\(inputFormat.sampleRate) outputRate=\(outputFormat.sampleRate) primeMethod=\(converter.primeMethod) primeMethodRaw=\(converter.primeMethod.rawValue) leadingFrames=\(converter.primeInfo.leadingFrames) trailingFrames=\(converter.primeInfo.trailingFrames) inputFrames=\(diagnosticInputFrames) outputBeforeFlush=\(before) flushFrames=\(outputFrames - before) outputTotal=\(outputFrames)")
+        return converter == nil ? [] : try drain(nil)
     }
     private func stamp(_ buffer: AVAudioPCMBuffer) -> PCMChunk {
         let time = origin + Double(outputFrames) / outputFormat.sampleRate
@@ -195,7 +180,6 @@ final class StreamingPCMConverter {
 // clock; only the iOS 27 target references Apple's newly introduced converter.
 final class SpeechInputConverter {
     private let format: AVAudioFormat
-    private let diagnosticLabel: String?
     private var sourceClock = AudioSourceClock()
     private var sourceFormat: AVAudioFormat?
     private var closed = false
@@ -208,8 +192,8 @@ final class SpeechInputConverter {
     private var segmentFrames: Int64 = 0
     #endif
 
-    init(format: AVAudioFormat, diagnosticLabel: String? = nil) {
-        self.format = format; self.diagnosticLabel = diagnosticLabel
+    init(format: AVAudioFormat) {
+        self.format = format
     }
     func convert(_ chunk: PCMChunk) throws -> [AnalyzerInput] {
         guard !closed else { throw AppFailure.message("종료된 STT 변환기에 입력했습니다.") }
@@ -224,7 +208,7 @@ final class SpeechInputConverter {
             #if PHASE2
             native = AnalyzerInputConverter(analyzerFormat: format, configurationHandler: nil)
             #else
-            pcm = try StreamingPCMConverter(from: chunk.buffer.format, to: format, origin: chunk.time, diagnosticLabel: diagnosticLabel)
+            pcm = try StreamingPCMConverter(from: chunk.buffer.format, to: format, origin: chunk.time)
             guard format.sampleRate >= 1, format.sampleRate <= 384000,
                   format.sampleRate.rounded() == format.sampleRate else {
                 throw AppFailure.message("STT 출력 샘플레이트 오류")

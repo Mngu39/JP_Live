@@ -14,22 +14,104 @@ struct PCMChunk: @unchecked Sendable {
 }
 
 @MainActor protocol AudioInput: AnyObject {
+    var progress: AudioInputProgress? { get }
     func start() async throws -> AsyncThrowingStream<PCMChunk, Error>
     func stop() async
 }
 
+extension AudioInput { var progress: AudioInputProgress? { nil } }
+
+struct AudioInputSnapshot: Codable, Sendable {
+    var capturedThrough: Double = 0
+    var processedThrough: Double = 0
+    var sourceBacklog: Double = 0
+    var pendingAudio: Double = 0
+    var peakPendingAudio: Double = 0
+    var pendingChunks: Int = 0
+}
+
+// The capture callback updates this directly; no per-buffer MainActor task can
+// itself accumulate ahead of the measurement. Reading never waits for inference.
+final class AudioInputProgress: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = AudioInputSnapshot()
+    private var started = false
+    func captured(_ chunk: PCMChunk) -> AudioInputSnapshot {
+        lock.lock(); defer { lock.unlock() }
+        if !started { value.processedThrough = chunk.time; started = true }
+        let duration = Double(chunk.buffer.frameLength) / chunk.buffer.format.sampleRate
+        value.capturedThrough = chunk.time + duration
+        value.pendingAudio += duration; value.pendingChunks += 1
+        value.peakPendingAudio = max(value.peakPendingAudio, value.pendingAudio)
+        value.sourceBacklog = max(0, value.capturedThrough - value.processedThrough)
+        return value
+    }
+    func processed(_ chunk: PCMChunk) {
+        lock.lock(); defer { lock.unlock() }
+        let duration = Double(chunk.buffer.frameLength) / chunk.buffer.format.sampleRate
+        value.processedThrough = chunk.time + duration
+        value.pendingAudio = max(0, value.pendingAudio - duration)
+        value.pendingChunks = max(0, value.pendingChunks - 1)
+        value.sourceBacklog = max(0, value.capturedThrough - value.processedThrough)
+    }
+    func snapshot() -> AudioInputSnapshot {
+        lock.lock(); defer { lock.unlock() }; return value
+    }
+}
+
+struct QualityPassDiagnostics: Codable, Sendable {
+    var backlog: Double = 0
+    var peakBacklog: Double = 0
+    var skippedChunks: Int = 0
+    var overloadStops: Int = 0
+    var analysisActivatedAt: Double?
+    var enhancementActivatedAt: Double?
+    var stoppedReason: String?
+    var acceptedThrough: Double?
+    var analyzerInputThrough: Double?
+    var recognitionThrough: Double?
+}
+
+struct LivePipelineDiagnostics: Codable, Sendable {
+    var input = AudioInputSnapshot()
+    var quality = QualityPassDiagnostics()
+    var qualityRevisions: Int = 0
+    var captionCount: Int = 0
+    var elapsed: Double = 0
+}
+
+// Injection seam for lifecycle/backpressure tests; production still uses the
+// same Apple SpeechTranscriber implementation, never a second STT backend.
+@MainActor protocol QualitySpeechSink: AnyObject {
+    func prepareForQuality(language: SourceLanguage,
+                           result: @escaping (String, Bool, Double, Double, Double?) -> Void,
+                           failure: @escaping (String) -> Void) async throws
+    func append(_ chunk: PCMChunk) throws
+    func finish(aborting: Bool) async throws
+}
+
+extension AppleSpeechEngine: QualitySpeechSink {
+    func prepareForQuality(language: SourceLanguage,
+                           result: @escaping (String, Bool, Double, Double, Double?) -> Void,
+                           failure: @escaping (String) -> Void) async throws {
+        try await prepare(language: language, result: result, failure: failure)
+    }
+}
+
 final class FileAudioInput: AudioInput {
     let url: URL
+    private(set) var progress: AudioInputProgress? = AudioInputProgress()
     private var task: Task<Void, Never>?
     init(url: URL) { self.url = url }
     func start() async throws -> AsyncThrowingStream<PCMChunk, Error> {
         guard task == nil else { throw AppFailure.message("이미 시작한 파일 입력입니다.") }
+        progress = AudioInputProgress()
         let granted = url.startAccessingSecurityScopedResource()
         let file: AVAudioFile
         do { file = try AVAudioFile(forReading: url) }
         catch { if granted { url.stopAccessingSecurityScopedResource() }; throw error }
         let (stream, continuation) = AsyncThrowingStream<PCMChunk, Error>.makeStream(bufferingPolicy: .bufferingOldest(30))
-        let producer = Task.detached { [url] in
+        let producer = Task.detached { [url, progress] in
             defer { if granted { url.stopAccessingSecurityScopedResource() } }
             do {
                 let rate = file.processingFormat.sampleRate
@@ -45,7 +127,9 @@ final class FileAudioInput: AudioInput {
                     guard buffer.frameLength > 0, file.framePosition > position else {
                         throw AppFailure.message("파일 끝에 도달하기 전에 오디오 읽기가 멈췄습니다.")
                     }
-                    switch continuation.yield(PCMChunk(buffer: buffer, time: Double(position)/rate)) {
+                    let chunk = PCMChunk(buffer: buffer, time: Double(position)/rate)
+                    _ = progress?.captured(chunk)
+                    switch continuation.yield(chunk) {
                     case .dropped: throw AppFailure.message("오디오 처리 지연이 3초를 초과했습니다. 입력을 중지했습니다.")
                     case .terminated: return
                     case .enqueued: break
@@ -134,7 +218,7 @@ final class AppleSpeechEngine {
     private var failed: String?
     private var inputObserver: ((AVAudioPCMBuffer, CMTime?) -> Void)?
     private var didStart = false
-    func prepare(language: SourceLanguage, result: @escaping (String, Bool, Double, Double) -> Void,
+    func prepare(language: SourceLanguage, result: @escaping (String, Bool, Double, Double, Double?) -> Void,
                  failure: @escaping (String) -> Void,
                  inputObserver: ((AVAudioPCMBuffer, CMTime?) -> Void)? = nil) async throws {
         guard SpeechTranscriber.isAvailable,
@@ -162,7 +246,9 @@ final class AppleSpeechEngine {
         resultTask = Task {
             do {
                 for try await r in transcriber.results {
-                    result(String(r.text.characters), r.isFinal, r.range.start.seconds, CMTimeRangeGetEnd(r.range).seconds)
+                    let frontier = r.resultsFinalizationTime.seconds
+                    result(String(r.text.characters), r.isFinal, r.range.start.seconds,
+                           CMTimeRangeGetEnd(r.range).seconds, frontier.isFinite ? frontier : nil)
                 }
             } catch {
                 if !Task.isCancelled { self.failed = error.localizedDescription; failure(error.localizedDescription) }
@@ -186,8 +272,8 @@ final class AppleSpeechEngine {
         @unknown default: throw AppFailure.message("알 수 없는 STT 입력 상태")
         }
     }
-    // Normal EOF and an explicit user stop drain accepted audio. On failure,
-    // abort instead of feeding more input into a failed analyzer.
+    // The caller chooses drain vs abort. Natural EOF drains accepted audio; explicit
+    // user Stop uses abort so teardown never waits for optional final text that is cleared.
     func finish(aborting: Bool = false) async throws {
         var finishingError: Error?
         if !aborting, failed == nil, didStart {

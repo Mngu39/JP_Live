@@ -207,16 +207,17 @@ final class SystemAudioInput: NSObject, AudioInput {
     private let picker = SCContentSharingPicker.shared
     private var active = false
     private var selectionID = UUID()
+    private(set) var progress: AudioInputProgress? = AudioInputProgress()
 
     func start() async throws -> AsyncThrowingStream<PCMChunk, Error> {
-        // System audio is loss-intolerant: do not kill a long live session merely
-        // because downstream work experiences a temporary burst. The live STT path
-        // is now decoupled from diarization, so this queue should remain near-empty
-        // in steady state; unbounded buffering is only a safety net for transient stalls.
-        let (sequence, continuation) = AsyncThrowingStream<PCMChunk, Error>.makeStream(bufferingPolicy: .unbounded)
+        // An optional pass is shed well before this emergency bound. Never silently
+        // drop live PCM or conceal unlimited latency/memory growth in an unbounded queue.
+        let (sequence, continuation) = AsyncThrowingStream<PCMChunk, Error>.makeStream(bufferingPolicy: .bufferingOldest(512))
+        let progress = AudioInputProgress()
+        self.progress = progress
         self.continuation = continuation
         active = true
-        let delegate = CaptureDelegate(owner: self, continuation: continuation)
+        let delegate = CaptureDelegate(owner: self, continuation: continuation, progress: progress)
         self.delegate = delegate
         var config = SCContentSharingPickerConfiguration()
         config.showsMicrophoneControl = false
@@ -393,11 +394,13 @@ private final class CaptureDelegate: NSObject, SCContentSharingPickerObserver, S
     weak var owner: SystemAudioInput?
     let continuation: AsyncThrowingStream<PCMChunk, Error>.Continuation
     let queue = DispatchQueue(label: "JP-Live.capture.audio")
+    private let progress: AudioInputProgress
     private var origin: Double?
     private var clock = AudioSourceClock()
     private var streamID: ObjectIdentifier?
-    init(owner: SystemAudioInput, continuation: AsyncThrowingStream<PCMChunk, Error>.Continuation) {
-        self.owner = owner; self.continuation = continuation
+    private var failed = false
+    init(owner: SystemAudioInput, continuation: AsyncThrowingStream<PCMChunk, Error>.Continuation, progress: AudioInputProgress) {
+        self.owner = owner; self.continuation = continuation; self.progress = progress
     }
     func activate(_ stream: SCStream) {
         // All SCStream callbacks use the capture clock. A new selected stream
@@ -415,7 +418,7 @@ private final class CaptureDelegate: NSObject, SCContentSharingPickerObserver, S
         Task { @MainActor in owner?.stopped(stream, error: error) }
     }
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard ObjectIdentifier(stream) == streamID, type == .audio, CMSampleBufferIsValid(sampleBuffer),
+        guard !failed, ObjectIdentifier(stream) == streamID, type == .audio, CMSampleBufferIsValid(sampleBuffer),
               let description = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description),
               let format = AVAudioFormat(streamDescription: asbd) else { return }
@@ -434,13 +437,19 @@ private final class CaptureDelegate: NSObject, SCContentSharingPickerObserver, S
         let time = pts-origin!
         do { _ = try clock.accept(time: time, frames: buffer.frameLength, rate: format.sampleRate) }
         catch { continuation.finish(throwing: error); return }
-        switch continuation.yield(PCMChunk(buffer: buffer, time: time)) {
+        let chunk = PCMChunk(buffer: buffer, time: time)
+        let pending = progress.captured(chunk)
+        guard pending.pendingAudio <= 6 else {
+            failed = true
+            continuation.finish(throwing: AppFailure.message("빠른 STT 입력 처리가 6초 이상 지연되어 중지했습니다. 실시간 진단값을 확인하세요."))
+            return
+        }
+        switch continuation.yield(chunk) {
         case .terminated: return
         case .enqueued: break
         case .dropped:
-            // .unbounded never drops under the current policy. Keep an explicit
-            // failure if that policy changes in the future rather than losing PCM silently.
-            continuation.finish(throwing: AppFailure.message("시스템 오디오 입력이 유실되었습니다."))
+            failed = true
+            continuation.finish(throwing: AppFailure.message("시스템 오디오 대기열 한도를 초과해 입력을 중지했습니다."))
         @unknown default:
             continuation.finish(throwing: AppFailure.message("알 수 없는 시스템 오디오 입력 상태"))
         }

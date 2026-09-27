@@ -62,53 +62,16 @@ final class AudioConversionTests: XCTestCase {
     }
     func testVeryShortEOFAndDoubleFlushDoNotDuplicateAudio() throws {
         let input = makeBuffer(signal(count: 37, rate: 44100), rate: 44100)
-        let converter = try StreamingPCMConverter(from: input.format, to: format(48000), origin: 0, diagnosticLabel: "short-37-44100-to-48000")
+        let converter = try StreamingPCMConverter(from: input.format, to: format(48000), origin: 0)
         let first = try converter.convert(input)
         let tail = try converter.flush()
         XCTAssertEqual(Double((first + tail).reduce(0) { $0 + Int($1.buffer.frameLength) }), 37*48000.0/44100, accuracy: 1.1)
         XCTAssertTrue(try converter.flush().isEmpty)
         XCTAssertThrowsError(try converter.convert(input))
     }
-    func testDiagnosticSRCImpulseAlignment() throws {
-        let cases: [(inputRate: Double, outputRate: Double, count: Int, name: String)] = [
-            (44100, 48000, 37, "44100-to-48000"),
-            (48000, 16000, 480, "48000-to-16000")
-        ]
-        for item in cases {
-            let positions = [0, item.count / 2, item.count - 1]
-            for position in positions {
-                var values = [Float](repeating: 0, count: item.count)
-                values[position] = 1
-                let label = "impulse-\(item.name)-pos-\(position)"
-                let input = makeBuffer(values, rate: item.inputRate)
-                let converter = try StreamingPCMConverter(
-                    from: input.format,
-                    to: format(item.outputRate),
-                    origin: 0,
-                    diagnosticLabel: label
-                )
-                let head = samples(try converter.convert(input))
-                let tail = samples(try converter.flush())
-                let all = head + tail
-                let threshold: Float = 0.0000001
-                let nonzero = all.indices.filter { abs(all[$0]) > threshold }
-                let peakIndex = all.indices.max { abs(all[$0]) < abs(all[$1]) }
-                let peakValue = peakIndex.map { all[$0] } ?? 0
-                let expected = Double(position) * item.outputRate / item.inputRate
-                let peakText = peakIndex.map(String.init) ?? "none"
-                let offsetText = peakIndex.map { String(Double($0) - expected) } ?? "none"
-                let firstNonzero = nonzero.first.map(String.init) ?? "none"
-                let lastNonzero = nonzero.last.map(String.init) ?? "none"
-                let headEnergy = head.reduce(0.0) { $0 + Double($1 * $1) }
-                let tailEnergy = tail.reduce(0.0) { $0 + Double($1 * $1) }
-                print("[PCM_ALIGN] case=\(label) inputFrames=\(item.count) impulseInputIndex=\(position) expectedOutputIndex=\(expected) headFrames=\(head.count) tailFrames=\(tail.count) totalFrames=\(all.count) peakIndex=\(peakText) peakOffset=\(offsetText) peakValue=\(peakValue) firstNonzero=\(firstNonzero) lastNonzero=\(lastNonzero) headEnergy=\(headEnergy) tailEnergy=\(tailEnergy)")
-            }
-        }
-    }
-
     func testSpeechInputTenMillisecondFramesUseConvertedSampleClock() throws {
         for rate in [16000.0, 24000, 44100, 48000] {
-            let converter = SpeechInputConverter(format: analyzerFormat(rate), diagnosticLabel: rate == 16000 ? "ten-ms-48000-to-16000" : nil)
+            let converter = SpeechInputConverter(format: analyzerFormat(rate))
             var inputs: [AnalyzerInput] = []
             for index in 0..<1000 {
                 inputs += try converter.convert(PCMChunk(buffer: makeBuffer(signal(count: 480, rate: 48000), rate: 48000),

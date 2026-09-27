@@ -26,6 +26,8 @@ struct TranscriptView: View {
     @State private var settings = false
     @State private var logs = false
     @State private var selection: PopupSelection?
+    @State private var synchronizedRow: UUID?
+    @State private var scrollingSource = true
     var body: some View {
         let translationLanguage = model.language
         let translationRevision = model.translationRevision
@@ -74,78 +76,19 @@ struct TranscriptView: View {
                     } label: { Image(systemName: "ellipsis").frame(width: 36, height: 36) }
                 }.padding(.horizontal, 12).frame(height: 42)
                 Divider()
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: 0) {
-                            if model.captions.isEmpty {
-                                VStack(spacing: 14) {
-                                    Image(systemName: "waveform").font(.largeTitle).foregroundStyle(.secondary)
-                                    Text("원문과 한국어 번역을 함께 표시합니다.").font(.callout)
-                                    HStack(spacing: 10) {
-                                        #if PHASE2
-                                        Button {
-                                            Task { await model.start(SystemAudioInput()) }
-                                        } label: {
-                                            Label("시스템 오디오 시작", systemImage: "play.fill")
-                                        }
-                                        .buttonStyle(.borderedProminent)
-                                        .disabled(model.running || model.changingLanguage)
-                                        #else
-                                        Button("오디오 파일 열기", systemImage: "waveform") { importAudio = true }
-                                            .buttonStyle(.borderedProminent)
-                                            .disabled(model.running || model.changingLanguage)
-                                        #endif
-                                        Picker("언어", selection: Binding(
-                                            get: { model.language },
-                                            set: { next in Task { await model.setLanguage(next) } }
-                                        )) {
-                                            ForEach(SourceLanguage.allCases) { language in Text(language.code).tag(language) }
-                                        }
-                                        .pickerStyle(.segmented)
-                                        .frame(width: 132)
-                                        .disabled(model.running || model.changingLanguage)
-                                    }
-                                }.frame(maxWidth: .infinity).padding(.vertical, 44)
-                            }
-                            ForEach(model.captions) { row in
-                                Group {
-                                    if dock {
-                                        HStack(alignment: .top, spacing: 18) {
-                                            source(row).frame(maxWidth: .infinity, alignment: .leading)
-                                            translation(row).frame(maxWidth: .infinity, alignment: .leading)
-                                        }
-                                    } else {
-                                        VStack(alignment: .leading, spacing: 7) { source(row); translation(row) }
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                    }
-                                }
-                                .padding(.leading, 30).padding(.trailing, 14).padding(.vertical, 12)
-                                .frame(minHeight: 44, alignment: .topLeading)
-                                .overlay(alignment: .leading) {
-                                    // The caption determines the overlay height. The full
-                                    // 30-point gutter remains tappable on multiline rows.
-                                    Button { selection = .init(row: row, token: nil) } label: {
-                                        RoundedRectangle(cornerRadius: 2)
-                                            .fill(gutterColor(row.gutterHint).opacity(0.4))
-                                            .frame(width: 3).padding(.vertical, 6)
-                                            .frame(width: 30).frame(maxHeight: .infinity)
-                                            .contentShape(Rectangle())
-                                    }.buttonStyle(.plain).accessibilityLabel("문장 번역")
-                                }.id(row.id)
-                                Divider().padding(.leading, 30)
-                            }
-                            Color.clear.frame(height: 1).id("bottom")
-                        }
+                if model.captions.isEmpty {
+                    emptyState.frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if dock {
+                    HStack(spacing: 0) {
+                        transcriptPane(original: true)
+                        Divider()
+                        transcriptPane(original: false)
                     }
-                    .simultaneousGesture(DragGesture().onChanged { _ in model.followLive = false })
-                    .onChange(of: model.captions.count) { _, _ in if model.followLive { proxy.scrollTo("bottom", anchor: .bottom) } }
-                    .onChange(of: model.captions.last?.revision) { _, _ in if model.followLive { proxy.scrollTo("bottom", anchor: .bottom) } }
-                    .overlay(alignment: .bottomTrailing) {
-                        if !model.followLive {
-                            Button("실시간으로", systemImage: "arrow.down") {
-                                model.followLive = true; proxy.scrollTo("bottom", anchor: .bottom)
-                            }.buttonStyle(.borderedProminent).padding(12)
-                        }
+                } else {
+                    VStack(spacing: 0) {
+                        transcriptPane(original: true)
+                        Divider()
+                        transcriptPane(original: false)
                     }
                 }
             }
@@ -165,6 +108,99 @@ struct TranscriptView: View {
         .sheet(isPresented: $settings) { SettingsView().environmentObject(model) }
         .sheet(isPresented: $logs) { LogsScreen() }
     }
+    private var emptyState: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "waveform").font(.largeTitle).foregroundStyle(.secondary)
+            Text("원문과 한국어 번역을 함께 표시합니다.").font(.callout)
+            HStack(spacing: 10) {
+                #if PHASE2
+                Button {
+                    Task { await model.start(SystemAudioInput()) }
+                } label: { Label("시스템 오디오 시작", systemImage: "play.fill") }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.running || model.changingLanguage)
+                #else
+                Button("오디오 파일 열기", systemImage: "waveform") { importAudio = true }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.running || model.changingLanguage)
+                #endif
+                Picker("언어", selection: Binding(get: { model.language },
+                    set: { next in Task { await model.setLanguage(next) } })) {
+                    ForEach(SourceLanguage.allCases) { language in Text(language.code).tag(language) }
+                }.pickerStyle(.segmented).frame(width: 132)
+                    .disabled(model.running || model.changingLanguage)
+            }
+        }.padding(16)
+    }
+
+    private func transcriptPane(original: Bool) -> some View {
+        VStack(spacing: 0) {
+            Text(original ? "원문" : "한국어 번역")
+                .font(.caption2).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 14).padding(.vertical, 5)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(model.captions) { row in
+                            VStack(spacing: 0) {
+                                Group {
+                                    if original { source(row) } else { translation(row) }
+                                }
+                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .topLeading)
+                                .padding(.leading, original ? 30 : 14).padding(.trailing, 14).padding(.vertical, 12)
+                                .overlay(alignment: .leading) {
+                                    if original {
+                                        Button {
+                                            if row.isFinal { selection = .init(row: row, token: nil) }
+                                        } label: {
+                                            RoundedRectangle(cornerRadius: 2)
+                                                .fill(gutterColor(row.gutterHint).opacity(row.gutterHint == .neutral ? 0.18 : 0.45))
+                                                .frame(width: 3).padding(.vertical, 6)
+                                                .frame(width: 30).frame(maxHeight: .infinity)
+                                                .contentShape(Rectangle())
+                                        }.buttonStyle(.plain).disabled(!row.isFinal)
+                                            .accessibilityLabel("확정 문장 고품질 번역")
+                                    }
+                                }
+                                Divider().padding(.leading, original ? 30 : 14)
+                            }.id(row.id)
+                        }
+                        Color.clear.frame(height: 1).id("bottom")
+                    }.scrollTargetLayout()
+                }
+                // Match semantic caption IDs, not pixel offsets: the two languages
+                // wrap differently. Only the pane being dragged writes the anchor.
+                .scrollPosition(id: Binding(get: { synchronizedRow }, set: { id in
+                    if !model.followLive && scrollingSource == original, let id { synchronizedRow = id }
+                }), anchor: .top)
+                .simultaneousGesture(DragGesture().onChanged { _ in
+                    scrollingSource = original; model.followLive = false
+                })
+                .onAppear {
+                    if model.followLive { proxy.scrollTo("bottom", anchor: .bottom) }
+                    else if let synchronizedRow { proxy.scrollTo(synchronizedRow, anchor: .top) }
+                }
+                .onChange(of: model.captions.count) { _, _ in
+                    if model.followLive { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+                .onChange(of: model.captions.last?.revision) { _, _ in
+                    if model.followLive { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+                .onChange(of: model.followLive) { _, follow in
+                    if follow { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if !model.followLive && !original {
+                        Button("실시간으로", systemImage: "arrow.down") {
+                            synchronizedRow = nil; model.followLive = true
+                        }.buttonStyle(.borderedProminent).padding(12)
+                    }
+                }
+            }
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
     private func source(_ row: Caption) -> some View {
         RubyText(text: row.source, tokens: row.tokens, ruby: row.language == .japanese && model.showRuby) {
             selection = .init(row: row, token: $0)

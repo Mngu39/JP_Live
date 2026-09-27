@@ -85,13 +85,31 @@ actor OptionalProviderPreparation {
     func cancel() {
         closed = true
         analysisTask?.cancel(); enhancementTask?.cancel()
-        analysisTask = nil; enhancementTask = nil
         readyAnalysis = nil; readyEnhancement = nil
+    }
+    func waitUntilFinished() async {
+        let analysis = analysisTask, enhancement = enhancementTask
+        await analysis?.value; await enhancement?.value
+        analysisTask = nil; enhancementTask = nil
     }
 }
 
 #if canImport(FluidAudio)
 import FluidAudio
+
+// Only explicitly prepared for separation; never loaded by the fast STT loop.
+// VadManager.process resets its recurrent state per call at the pinned revision,
+// so the second stem does not inherit the first stem's state.
+actor FluidStemSpeechDetector: StemSpeechDetector {
+    private let manager: VadManager
+    init() async throws { manager = try await VadManager() }
+    func probabilities(_ samples: [Float]) async throws -> [Float] {
+        try Task.checkCancellation()
+        let results = try await manager.process(samples)
+        try Task.checkCancellation()
+        return results.map(\.probability)
+    }
+}
 
 actor FluidSpeechAnalysis: SpeechAnalysisProvider {
     private var diarizer: LSEENDDiarizer?

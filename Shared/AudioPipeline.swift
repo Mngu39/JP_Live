@@ -26,6 +26,21 @@ enum AudioAnalysisDeliveryPolicy: Sendable {
     case qualityRevision
 }
 
+// Includes queued AND currently processing audio. Overflow disables the optional
+// pass; silently dropping a middle buffer would invalidate its time correspondence.
+struct QualityAudioBudget {
+    private(set) var duration: Double = 0
+    private(set) var count = 0
+    mutating func reserve(duration value: Double) -> Bool {
+        guard value.isFinite, value > 0, count < 256, duration + value <= 3 else { return false }
+        duration += value; count += 1
+        return true
+    }
+    mutating func release(duration value: Double) {
+        duration = max(0, duration - value); count = max(0, count - 1)
+    }
+}
+
 actor AudioPreprocessor {
     private var floatConverter: StreamingPCMConverter?
     private var sourceClock = AudioSourceClock()

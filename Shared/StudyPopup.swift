@@ -12,6 +12,8 @@ struct StudyPopup: View {
     @Environment(\.dismiss) private var dismiss
     @State private var token: WordToken?
     @State private var baseTokens: [WordToken]
+    @State private var analyzedMode: SudachiSplitMode?
+    @State private var morphologyGeneration = UUID()
     @State private var lemmaReading = ""
     @State private var lemmaReadingKey = ""
     @State private var baseTranslation = ""
@@ -33,7 +35,9 @@ struct StudyPopup: View {
     private var row: Caption { selection.row }
     private var tokens: [WordToken] { useAI ? reconstruction?.units ?? baseTokens : baseTokens }
     private var translation: String { useAI ? reconstruction?.translation ?? baseTranslation : baseTranslation }
-    private var selectedKey: String { "\(token?.id ?? "sentence"):\(useAI)" }
+    private var popupMode: SudachiSplitMode { row.language == .japanese ? app.splitMode : .c }
+    private var tokensReady: Bool { analyzedMode == popupMode && !baseTokens.isEmpty }
+    private var selectedKey: String { "\(token?.id ?? "sentence"):\(useAI):\(popupMode.rawValue):\(morphologyGeneration)" }
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -75,8 +79,8 @@ struct StudyPopup: View {
                             Button("최근 세션에 저장", systemImage: "square.and.arrow.down") {
                                 if let session = app.selectedSession() { Task { await save(session) } }
                                 else { choosingSession = true }
-                            }.buttonStyle(.borderedProminent).disabled(busy || baseTokens.isEmpty)
-                            Button("세션 선택", systemImage: "plus") { choosingSession = true }.buttonStyle(.bordered).disabled(busy || baseTokens.isEmpty)
+                            }.buttonStyle(.borderedProminent).disabled(busy || !tokensReady)
+                            Button("세션 선택", systemImage: "plus") { choosingSession = true }.buttonStyle(.bordered).disabled(busy || !tokensReady)
                         }
                     }
                 }.padding(22)
@@ -93,7 +97,7 @@ struct StudyPopup: View {
                             Task { await toggleAI() }
                         } label: {
                             if aiBusy { ProgressView() } else { Image(systemName: useAI ? "sparkles.square.filled.on.square" : "sparkles") }
-                        }.accessibilityLabel(useAI ? "기본 분석으로 돌아가기" : "AI 재구성").disabled(aiBusy || busy || baseTokens.isEmpty)
+                        }.accessibilityLabel(useAI ? "기본 분석으로 돌아가기" : "AI 재구성").disabled(aiBusy || busy || !tokensReady)
                     }
                     Button("닫기") { dismiss() }
                 }
@@ -108,11 +112,20 @@ struct StudyPopup: View {
             .sheet(item: $dictionaryDestination) { destination in
                 DictionaryScreen(term: destination.term, url: destination.url)
             }
-            .task {
-                guard baseTokens.isEmpty else { return }
+            .task(id: popupMode) {
+                let mode = popupMode
+                let selected = analyzedMode == nil ? token : nil
+                morphologyGeneration = UUID()
+                baseTokens = []; token = selected; useAI = false; reconstruction = nil
+                lemmaReading = ""; lemmaReadingKey = ""
                 do {
                     let value = try await app.analyzeWords(row.source, language: row.language)
-                    if !Task.isCancelled { baseTokens = value }
+                    if !Task.isCancelled && mode == popupMode {
+                        baseTokens = value; analyzedMode = mode
+                        if let selected {
+                            token = value.first { $0.start == selected.start && $0.end == selected.end && $0.surface == selected.surface }
+                        }
+                    }
                 } catch { if !Task.isCancelled { self.error = error.localizedDescription } }
             }
             .task(id: selectedKey + ":reading") {
@@ -136,7 +149,8 @@ struct StudyPopup: View {
                 meaning = ""
                 if useAI, let value = selected.meaning, !value.isEmpty { meaning = value; return }
                 do {
-                    let value = try await WorkerClient.shared.translate(selected.lemma, language: row.language)
+                    let value = try await WorkerClient.shared.translate(selected.lemma, language: row.language,
+                        context: row.language == .english ? row.source : nil)
                     if !Task.isCancelled { meaning = value }
                 } catch { if !Task.isCancelled { self.error = error.localizedDescription } }
             }
@@ -190,12 +204,16 @@ struct StudyPopup: View {
         return text
     }
     private func toggleAI() async {
+        guard tokensReady else { return }
+        let generation = morphologyGeneration
         error = ""
         if reconstruction == nil {
             aiBusy = true; defer { aiBusy = false }
             do {
                 if baseTranslation.isEmpty { baseTranslation = try await WorkerClient.shared.translate(row.source, language: row.language) }
-                reconstruction = try await WorkerClient.shared.reconstruct(row, translation: baseTranslation, tokens: baseTokens)
+                let value = try await WorkerClient.shared.reconstruct(row, translation: baseTranslation, tokens: baseTokens)
+                guard generation == morphologyGeneration, tokensReady else { return }
+                reconstruction = value
             }
             catch { self.error = error.localizedDescription; return }
         }
@@ -204,11 +222,11 @@ struct StudyPopup: View {
         if let old { token = tokens.first { $0.start < old.end && $0.end > old.start } }
     }
     private func save(_ session: LearningSession) async {
-        guard !busy, !baseTokens.isEmpty else { return }
+        guard !busy, tokensReady else { return }
         busy = true; error = ""; saveStatus = ""; defer { busy = false }
         let savedToken = token, savedTokens = tokens
-        let screenshot = await app.learningScreenshot()
         var savedTranslation = translation
+        let screenshot = await app.learningScreenshot()
         do {
             if savedTranslation.isEmpty {
                 savedTranslation = try await WorkerClient.shared.translate(row.source, language: row.language)

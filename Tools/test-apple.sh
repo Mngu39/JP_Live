@@ -2,12 +2,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PHASE="${1:-1}"
-REQUESTED_PHASE="$PHASE"
 case "$PHASE" in
   1) MIN_SDK=26 ;;
-  1-trace) PHASE=1; MIN_SDK=26 ;;
   2) MIN_SDK=27 ;;
-  *) echo "Usage: bash Tools/test-apple.sh [1|1-trace|2]" >&2; exit 2 ;;
+  *) echo "Usage: bash Tools/test-apple.sh [1|2]" >&2; exit 2 ;;
 esac
 SDK_VERSION="$(xcrun --sdk iphonesimulator --show-sdk-version)"
 if [[ "${SDK_VERSION%%.*}" -lt "$MIN_SDK" ]]; then
@@ -22,6 +20,22 @@ python3 -B "$ROOT/Tools/source_checksums.py" normalize \
   "$ROOT/SHA256SUMS.txt" "$RUN/source-SHA256SUMS.txt"
 (cd "$ROOT" && shasum -a 256 -c "$RUN/source-SHA256SUMS.txt") 2>&1 | tee "$RUN/checksums.log"
 python3 -B "$ROOT/Tests/test_source_checksums.py" 2>&1 | tee "$RUN/checksum-tests.log"
+python3 -B "$ROOT/Tests/test_sudachi_resources.py" 2>&1 | tee "$RUN/sudachi-resource-tests.log"
+python3 -B "$ROOT/Tests/test_separator_assets.py" 2>&1 | tee "$RUN/separator-asset-tests.log"
+if [[ "$PHASE" == 2 ]]; then
+  # The separator is prepared explicitly in a separate model stage. An empty
+  # resource directory keeps model-free builds honest and functional.
+  mkdir -p "$ROOT/BuildOutputs/Separation"
+  python3 -B "$ROOT/Tools/separator_assets.py" "$ROOT/BuildOutputs/Separation" 2>&1 | tee "$RUN/separator-assets.log"
+  if [[ -f "$ROOT/BuildOutputs/Separation/asset-manifest.json" ]]; then
+    cp "$ROOT/BuildOutputs/Separation/asset-manifest.json" "$RUN/separator-manifest.log"
+    cp "$ROOT/BuildOutputs/Separation/conversion-report.json" "$RUN/separator-conversion.log"
+  fi
+  # Required native app dependency. Prepare before Xcode discovers build inputs.
+  bash "$ROOT/Tools/build-sudachi-macos.sh" 2>&1 | tee "$RUN/sudachi-build.log"
+  cp "$ROOT/BuildOutputs/Sudachi/Resources/Sudachi/asset-manifest.json" "$RUN/sudachi-assets.log"
+  cp "$ROOT/BuildOutputs/Sudachi/Cargo.lock" "$RUN/sudachi-Cargo.lock.log"
+fi
 PROJECT="$ROOT/Phase$PHASE/JPLive.xcodeproj"
 RESOLVED="$PROJECT/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
 # Evidence identifies the exact source and toolchain; a later ZIP cannot inherit it.
@@ -39,9 +53,6 @@ run_xcodebuild() {
     else
       xcodebuild "$@" -skipPackagePluginValidation
     fi
-  elif [[ "$REQUESTED_PHASE" == 1-trace ]]; then
-    xcodebuild "$@" \
-      -only-testing:JPLiveTests/AudioConversionTests/testDiagnosticSRCImpulseAlignment
   else
     xcodebuild "$@"
   fi
@@ -55,10 +66,6 @@ run_xcodebuild -project "$PROJECT" -scheme JPLive -configuration Debug \
   -destination "platform=iOS Simulator,id=$DESTINATION_ID" \
   -derivedDataPath "$RUN/DerivedData" -resultBundlePath "$RUN/tests.xcresult" \
   -parallel-testing-enabled NO test CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$RUN/tests.log"
-if [[ "$REQUESTED_PHASE" == 1-trace ]]; then
-  echo "DIAGNOSTIC ONLY: SRC impulse-alignment probe; not full validation or a device-build pass."
-  exit 0
-fi
 run_xcodebuild -project "$PROJECT" -scheme JPLive -configuration Release \
   -destination 'generic/platform=iOS' \
   -derivedDataPath "$RUN/DeviceDerivedData" build CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$RUN/device-build.log"

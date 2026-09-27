@@ -1,0 +1,9 @@
+# Candidate reproducible export environment: Python 3.11, Apple Silicon macOS.
+# Exact top-level versions; not a claim of successful conversion or full lockfile.
+torch==2.5.1
+torchaudio==2.5.1
+speechbrain==1.0.3
+coremltools==8.3.0
+numpy==1.26.4
+soundfile==0.12.1
+huggingface-hub==0.28.1

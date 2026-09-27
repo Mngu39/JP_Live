@@ -27,10 +27,21 @@
   },
   "Sudachi": {
     "revision": "90fd6068c80c2fc3b63e0dbab0e341475bad4d8f",
-    "status": "Rust bridge source; native binary and dictionary not bundled"
+    "status": "A/B/C source and Phase 2 build wiring present; native build/assets/runtime NOT RUN",
+    "resourcePackages": {
+      "SudachiPy": "0.6.11",
+      "SudachiDict-full": "20260723.1"
+    },
+    "generatedAssets": "BuildOutputs/Sudachi",
+    "resourceBuilder": "Tools/build-sudachi-macos.sh"
   },
   "separator": {
-    "status": "experimental exporter; no weights bundled"
+    "status": "Source pinned and preparation/asset verification implemented; model conversion, Japanese quality, Apple build and iPad runtime NOT RUN",
+    "source": "speechbrain/sepformer-whamr16k",
+    "revision": "21a5b500c6f52fddc387c5d9e5fb13ffd6f039c5",
+    "license": "Apache-2.0 (model card declaration)",
+    "preparation": "Tools/prepare-separator-macos.sh",
+    "assetVerification": "Tools/separator_assets.py"
   },
   "Phase1": {
     "externalSwiftPackages": [],
@@ -41,12 +52,12 @@
       "Apple Speech ja-JP/en-US",
       "Apple Translation source language to ko"
     ],
-    "lastUserReportedBuild": {
+    "newResolveCompileRun": "NOT RUN for local-stage2-2026-09-21; historical failures are not current results",
+    "historicalLanguageToolsFailure": {
       "dependencyResolution": "passed after external packages removed",
       "compile": "failed with three LanguageTools diagnostics: CFLocaleIdentifier, StringTransform inference, Bundle.module",
       "runtime": "not reached"
-    },
-    "newResolveCompileRun": "NOT RUN for the current LanguageTools/resource-loading fix"
+    }
   },
   "Phase2Resolution": {
     "status": "RESOLVED and locked: 9 dependencies from actual Phase 2 CI run 7; exact bytes preserved",

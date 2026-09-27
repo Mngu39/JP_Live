@@ -38,6 +38,8 @@ struct Caption: Identifiable, Codable {
     // Analysis-local ID for chunk boundaries; never a UI identity/color index.
     var speaker: Int? = nil
     var gutterHint: SpeakerGutterHint = .neutral
+    // Local to a separated interval; these lane numbers are not persistent people.
+    var separationGroup: UUID? = nil
     var contextGroup: String { "stt:\(captureID.uuidString):\(id.uuidString)" }
 }
 
@@ -113,6 +115,12 @@ struct SentenceBoundary {
 struct TranscriptRevisionEffect: Sendable {
     var updatedID: UUID
     var removedIDs: [UUID]
+}
+
+enum TranscriptRevisionResolution {
+    case pending
+    case rejected
+    case applied(TranscriptRevisionEffect)
 }
 
 

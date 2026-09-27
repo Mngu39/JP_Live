@@ -778,7 +778,7 @@ final class DeviceValidationController: ObservableObject {
 
         do {
             try Task.checkCancellation()
-            try await speech.prepare(language: language, result: { _, final, _, _ in
+            try await speech.prepare(language: language, result: { _, final, _, _, _ in
                 metrics.recordSpeechResult(final: final)
             }, failure: { message in
                 metrics.recordError("STT 비동기 오류: \(message)")
@@ -825,6 +825,7 @@ final class DeviceValidationController: ObservableObject {
                     try speech.append(output)
                     metrics.recordSpeechAppend(frames: Int(output.buffer.frameLength))
                 }
+                input.progress?.processed(chunk)
                 if !processed.isEmpty && !screenshotTriggered { status = "PCM 수신 중 · 20~30초 권장" }
             }
         } catch {
