@@ -27,10 +27,10 @@
   },
   "Sudachi": {
     "revision": "90fd6068c80c2fc3b63e0dbab0e341475bad4d8f",
-    "status": "A/B/C source and Phase 2 build wiring present; native build/assets/runtime NOT RUN",
+    "status": "A/B/C source and Phase 2 build wiring present; Apple CI Phase 1 PASS; Phase 2 native Sudachi compatibility rerun pending",
     "resourcePackages": {
-      "SudachiPy": "0.7.0",
-      "SudachiDict-full": "20260723.1"
+      "SudachiPy": "0.6.11",
+      "SudachiDict-full": "20260723"
     },
     "generatedAssets": "BuildOutputs/Sudachi",
     "resourceBuilder": "Tools/build-sudachi-macos.sh"

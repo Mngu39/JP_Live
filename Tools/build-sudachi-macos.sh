@@ -10,7 +10,7 @@ STAGE="$(mktemp -d "$ROOT/BuildOutputs/sudachi-stage.XXXXXX")"
 cp -R "$ROOT/Native/SudachiBridge" "$STAGE/Bridge"
 # Generated dependency locks and compiler outputs stay outside checksummed source.
 python3 -m venv "$STAGE/python"
-"$STAGE/python/bin/python" -m pip install --disable-pip-version-check 'SudachiPy==0.7.0' 'SudachiDict-full==20260723.1'
+"$STAGE/python/bin/python" -m pip install --disable-pip-version-check 'SudachiPy==0.6.11' 'SudachiDict-full==20260723'
 "$STAGE/python/bin/python" "$ROOT/Tools/prepare-sudachi-resources.py" "$STAGE/Resources/Sudachi"
 cd "$STAGE/Bridge"
 cargo generate-lockfile

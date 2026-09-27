@@ -57,6 +57,19 @@ class PackagingTests(unittest.TestCase):
             self.assertIn(f"'{name}=={version}'", script)
             self.assertEqual(inventory[name], version)
 
+    def test_rust_and_resource_version_family_stays_compatible(self):
+        root = Path(__file__).parents[1]
+        cargo = (root/'Native/SudachiBridge/Cargo.toml').read_text(encoding='utf-8')
+        revision = '90fd6068c80c2fc3b63e0dbab0e341475bad4d8f'
+        self.assertIn(f'rev = "{revision}"', cargo)
+        # This pinned Rust revision is Sudachi 0.6.11. Keep its resource/parser
+        # family on 0.6.x; SudachiPy 0.7 resources contain categories/formats
+        # that this native parser does not support.
+        self.assertEqual(module.VERSIONS, {
+            'SudachiPy': '0.6.11',
+            'SudachiDict-full': '20260723',
+        })
+
     def test_version_mismatch_rejected(self):
         self.packages['SudachiPy'].version = 'unexpected'
         with self.assertRaisesRegex(ValueError, 'expected'): module.prepare(self.output)

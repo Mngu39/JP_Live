@@ -1,13 +1,14 @@
-# stage8.4 Chat CI follow-up — 2026-09-27
+# stage8.5 Chat CI follow-up — 2026-09-28
 
-Uploaded Apple-validation evidence from stage8.3 exposed two CI blockers before product runtime validation.
+The stage8.4 Apple-validation rerun produced a clean Phase 1 result and a new, narrower Phase 2 native-Sudachi compatibility failure. Product runtime/STT source is unchanged in stage8.5.
 
-- **Phase 1:** XCTest reached the quality EOF/lease tests, then `testQualityEOFBudgetReturnsWithoutReleasingUnfinishedNativeWork` failed at its final lease assertion and the next lease test waited indefinitely until the 45-minute job timeout. The production quality path was not changed here. The failing test deliberately configured a 10 ms EOF timeout and then reused that same tiny budget for cleanup, which was scheduler-dependent on the GitHub simulator. stage8.4 waits up to 2 seconds for the synthetic cancelled worker to release the lease after its held native finish is explicitly resumed, and test-only preparation/finish waits now fail within 5 seconds instead of hanging the entire CI job.
-- **Phase 2:** preflight stopped before Xcode because `SudachiDict-full==20260723.1` requires SudachiPy >=0.7.0 while the build tool pinned 0.6.11. stage8.4 updates the resource pin to `SudachiPy==0.7.0` consistently in the build script, resource manifest code, dependency inventory, and this handoff. No app-runtime Sudachi code or dictionary version is changed.
-- Neither uploaded run produced `PASS.txt`; Phase 1 did not reach the Release device build and Phase 2 did not reach package resolution/XCTest/device build. Re-run both phases after this patch before producing/installing the IPA.
-- Local stage8.4 checks: source manifest 80/80, Python regressions 27/27, Swift frontend parse 40/40, Shared↔Phase1 product mirrors, and shell syntax all pass. This environment still cannot run the Apple XCTest/device build that must verify the patch.
+- **Phase 1 is now a real PASS.** The artifact contains `PASS.txt` with `PASS: Phase 1 Apple compile, simulator XCTest, unsigned device build`. Simulator XCTest executed 126 tests with 0 failures and the Release `iphoneos` build ended with `** BUILD SUCCEEDED **`. The stage8.4 bounded-wait test fix therefore removed the prior lease-test hang without changing production `QualitySpeechPass`.
+- **Phase 2 got past the previous pip resolver conflict.** `SudachiPy==0.7.0` and `SudachiDict-full==20260723.1` installed and the Rust bridge compiled, but its real-dictionary test failed before Xcode with `Invalid character category definition: Invalid type NOOOVEOW at line 176`. The pinned native crate is still Sudachi Rust 0.6.11 (`90fd606...`). SudachiPy 0.7 resources belong to the 0.7 resource/dictionary family, while this native parser is 0.6.11.
+- **stage8.5 keeps the native Rust revision and app code unchanged** and instead restores a consistent 0.6-family resource set: `SudachiPy==0.6.11` + `SudachiDict-full==20260723` (without `.1`). The 20260723 package is the pre-0.7 dictionary line; `.1` was repackaged for the 0.7 dependency family. This is intentionally narrower than upgrading the native Rust bridge to unstable 0.7 APIs/formats.
+- A repository regression now binds the pinned Rust revision to that resource-version family, in addition to the existing build-script/prepare-script/`DEPENDENCIES.json` equality check. A future deliberate native Sudachi upgrade must update this compatibility assertion rather than silently mixing major resource families.
+- **Phase 2 is still not claimed.** Re-run Phase 2 after this patch. It must still prove native Rust dictionary tests, all three iOS architecture builds/XCFramework creation, package resolution, simulator XCTest, and unsigned device build.
 
-The STT correctness/product-source changes from stage8.3 are otherwise unchanged.
+The stage8.3 STT correctness/product-source changes and stage8.4 Phase 1 test-only synchronization fix are otherwise unchanged.
 
 ---
 
@@ -182,7 +183,7 @@ SHA256: `e59c45e13d573079b8dad2bca63359cf5bedc04cebaa7822f1934355370dd94a`
 ## 이번 후속 구현 — 소스 반영, Apple 실행 미검증
 
 - Sudachi A/B/C(default C)를 설정 저장→Rust ABI→mode별 cache→현재/과거 자막 재분석→popup까지 연결했다. 재분석 도중의 오래된 AI/형태소 응답과 저장 snapshot 혼합을 방지했다. native 실패/미연결은 화면에서 Apple fallback으로 구분한다.
-- Phase 2 target에 생성될 Sudachi XCFramework와 사전 폴더를 연결했다. macOS 준비 도구가 pinned SudachiPy 0.7.0 / SudachiDict-full 20260723.1, 라이선스와 자산 hash를 수집하고 실제 사전 기반 Rust 검사 후 3개 iOS 아키텍처를 빌드하도록 했다. 바이너리/사전은 아직 생성하지 않았다. cargo transitive lock은 최초 빌드에서 생성·기록되며 현재 소스에 고정된 것은 아니다.
+- Phase 2 target에 생성될 Sudachi XCFramework와 사전 폴더를 연결했다. macOS 준비 도구가 pinned SudachiPy 0.6.11 / SudachiDict-full 20260723, 라이선스와 자산 hash를 수집하고 실제 사전 기반 Rust 검사 후 3개 iOS 아키텍처를 빌드하도록 했다. 바이너리/사전은 아직 생성하지 않았다. cargo transitive lock은 최초 빌드에서 생성·기록되며 현재 소스에 고정된 것은 아니다.
 - RAIL은 원문 위/번역 아래, DOCK은 좌우의 독립 pane이다. 스크롤은 caption ID 기준으로 맞춘다. 전체 row gutter의 고품질 문장 action은 확정 자막만 허용한다. 실제 화면 크기/스크롤 검증은 미실행이다.
 - history를 자르지 않고 caption ID→index cache(최대 2048)와 직접 mutation으로 반복 검색/배열 복사 경로를 줄였다. mode 변경 시에는 한 작업으로 이력을 순차 재분석한다.
 - 영어 단어 popup이 기존 /run/translate에 optional context로 현재 caption을 전달한다. Worker는 문자열/12000 UTF-16 길이를 검증하고 DeepL context로 전달한다. 기존 context 없는 요청/응답은 유지한다. route의 비동기 오류가 JSON 400/401로 반환되도록 await를 수정했다. 배포 전에는 수정된 context 동작을 실서비스 성공으로 간주하지 않는다.
