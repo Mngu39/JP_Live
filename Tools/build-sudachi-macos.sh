@@ -35,5 +35,5 @@ if [[ -e "$ROOT/BuildOutputs/Sudachi" ]]; then
   mv "$ROOT/BuildOutputs/Sudachi" "$STAGE/Previous"
 fi
 mv "$STAGE/Ready" "$ROOT/BuildOutputs/Sudachi"
-echo "Prepared: BuildOutputs/Sudachi (framework, full dictionary, licenses, asset hashes, Cargo.lock)"
+echo "Prepared: BuildOutputs/Sudachi (framework, full dictionary, license evidence, asset hashes, Cargo.lock)"
 echo "Phase 2 links and bundles these files; Phase 1 stays dependency-free."

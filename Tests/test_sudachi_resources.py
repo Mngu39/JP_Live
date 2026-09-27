@@ -11,8 +11,9 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 class Distribution:
-    def __init__(self, root, version, files):
+    def __init__(self, root, version, files, license_name='Apache-2.0'):
         self.root, self.version, self.files = root, version, [Path(p) for p in files]
+        self.metadata = {'License': license_name}
     def locate_file(self, file): return self.root/file
 
 class PackagingTests(unittest.TestCase):
@@ -48,6 +49,20 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(module.hashlib.sha256((self.output/name).read_bytes()).hexdigest(), expected)
         self.assertEqual(len(list((self.output/'licenses').rglob('LICENSE'))), 2)
 
+    def test_missing_packaged_license_uses_verified_metadata_evidence(self):
+        self.packages['SudachiPy'].files = []
+        module.prepare(self.output)
+        marker = self.output/'licenses/SudachiPy/PACKAGE-LICENSE-METADATA.txt'
+        self.assertTrue(marker.is_file())
+        text = marker.read_text(encoding='utf-8')
+        self.assertIn('Declared-License: Apache-2.0', text)
+        self.assertIn('Packaged-License-File: absent', text)
+
+    def test_missing_packaged_license_with_unexpected_metadata_is_rejected(self):
+        self.packages['SudachiPy'].files = []
+        self.packages['SudachiPy'].metadata['License'] = 'unexpected'
+        with self.assertRaisesRegex(ValueError, 'expected'):
+            module.prepare(self.output)
 
     def test_version_pins_match_build_script_and_dependency_inventory(self):
         root = Path(__file__).parents[1]
@@ -83,9 +98,5 @@ class PackagingTests(unittest.TestCase):
     def test_missing_dictionary_rejected(self):
         (self.root/'sudachidict_full/resources/system.dic').unlink()
         with self.assertRaisesRegex(ValueError, 'expected resources'): module.prepare(self.output)
-
-    def test_missing_license_rejected(self):
-        self.packages['SudachiDict-full'].files = []
-        with self.assertRaisesRegex(ValueError, 'no packaged license'): module.prepare(self.output)
 
 if __name__ == '__main__': unittest.main()

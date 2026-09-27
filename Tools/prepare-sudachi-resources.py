@@ -1,4 +1,4 @@
-"""Stage pinned installed Sudachi resources; no network calls or production writes."""
+"""Stage pinned installed Sudachi resources plus package license evidence; no network calls or production writes."""
 import argparse
 import hashlib
 import importlib.metadata
@@ -7,6 +7,52 @@ from pathlib import Path
 import shutil
 
 VERSIONS = {'SudachiPy': '0.6.11', 'SudachiDict-full': '20260723'}
+EXPECTED_LICENSES = {'SudachiPy': 'Apache-2.0', 'SudachiDict-full': 'Apache-2.0'}
+LICENSE_NAME_MARKERS = ('LICENSE', 'COPYING', 'NOTICE', 'LEGAL')
+
+def _declared_license(dist):
+    metadata = getattr(dist, 'metadata', None)
+    if metadata is None or not hasattr(metadata, 'get'):
+        return None
+    for key in ('License-Expression', 'License'):
+        value = metadata.get(key)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+def _copy_license_evidence(name, dist, destination):
+    target_root = destination/'licenses'/name
+    copied = 0
+    for entry in dist.files or []:
+        if not any(word in entry.name.upper() for word in LICENSE_NAME_MARKERS):
+            continue
+        original = Path(dist.locate_file(entry))
+        if original.is_file():
+            target = target_root/Path(str(entry))
+            base = target_root.resolve()
+            if not target.resolve().is_relative_to(base):
+                raise ValueError(f'Unsafe license path: {entry}')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(original, target)
+            copied += 1
+    if copied:
+        return copied
+
+    expected = EXPECTED_LICENSES[name]
+    declared = _declared_license(dist)
+    if declared != expected:
+        raise ValueError(
+            f'{name} has no packaged license file and declares {declared!r}; expected {expected!r}'
+        )
+    target_root.mkdir(parents=True, exist_ok=True)
+    (target_root/'PACKAGE-LICENSE-METADATA.txt').write_text(
+        f'Package: {name}\n'
+        f'Version: {dist.version}\n'
+        f'Declared-License: {declared}\n'
+        'Packaged-License-File: absent\n'
+        'Status: build-time license evidence only; review the upstream license before redistribution.\n',
+        encoding='utf-8', newline='\n')
+    return 1
 
 def prepare(destination):
     destination = Path(destination)
@@ -29,21 +75,7 @@ def prepare(destination):
     config['userDict'] = []
     (destination/'sudachi.json').write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n', encoding='utf-8', newline='\n')
     for name, dist in packages.items():
-        copied = 0
-        for entry in dist.files or []:
-            if not any(word in entry.name.upper() for word in ('LICENSE', 'COPYING', 'NOTICE')):
-                continue
-            original = Path(dist.locate_file(entry))
-            if original.is_file():
-                target = destination/'licenses'/name/Path(str(entry))
-                base = (destination/'licenses'/name).resolve()
-                if not target.resolve().is_relative_to(base):
-                    raise ValueError(f'Unsafe license path: {entry}')
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(original, target)
-                copied += 1
-        if not copied:
-            raise ValueError(f'{name} has no packaged license file; inspect before redistribution')
+        _copy_license_evidence(name, dist, destination)
     hashes = {p.relative_to(destination).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
               for p in sorted(destination.rglob('*')) if p.is_file()}
     (destination/'asset-manifest.json').write_text(
@@ -54,4 +86,4 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('destination', type=Path)
     args = parser.parse_args()
-    print(f'Staged {prepare(args.destination)} resource/license files')
+    print(f'Staged {prepare(args.destination)} resource/license-evidence files')

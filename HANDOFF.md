@@ -1,3 +1,17 @@
+# stage8.6 Chat CI follow-up — 2026-09-28
+
+The stage8.5 Phase 2 rerun installed the intended compatible resource family (`SudachiPy==0.6.11` + `SudachiDict-full==20260723`) successfully, so the prior resolver/resource-generation mismatch is not recurring. It stopped earlier than the Rust dictionary test because the released macOS SudachiPy 0.6.11 wheel exposes no packaged `LICENSE`/`COPYING`/`NOTICE` file through `importlib.metadata.Distribution.files`, and our staging guard treated that packaging omission as fatal.
+
+- **No product/runtime/native behavior changes.** `Shared/`, both app targets, `Native/SudachiBridge`, the Rust revision, STT/Stop/Clear/Quality code, and Worker are byte-identical to stage8.5.
+- `Tools/prepare-sudachi-resources.py` still copies real packaged license/notice/legal files whenever the installed distribution provides them. If a pinned package has none, it now accepts only the expected `Apache-2.0` declaration from installed package metadata and writes `PACKAGE-LICENSE-METADATA.txt` as explicit build-time evidence instead of pretending a license file was packaged. Any absent or changed license declaration remains a hard failure.
+- The fallback marker explicitly says it is **build-time license evidence only** and that upstream licensing must be reviewed before redistribution. This unblocks Apple CI asset generation without weakening the version/resource checks or claiming redistribution review is complete.
+- A regression covers the exact SudachiPy-0.6.11-wheel case plus rejection of unexpected metadata.
+- Phase 2 must be rerun. It still has to reach and pass the real-dictionary Rust test, three iOS Rust builds/XCFramework creation, Xcode package resolution, simulator XCTest, and unsigned device build.
+
+The stage8.3 STT correctness/product-source changes, stage8.4 Phase 1 synchronization fix, and stage8.5 0.6-family compatibility pins are otherwise unchanged.
+
+---
+
 # stage8.5 Chat CI follow-up — 2026-09-28
 
 The stage8.4 Apple-validation rerun produced a clean Phase 1 result and a new, narrower Phase 2 native-Sudachi compatibility failure. Product runtime/STT source is unchanged in stage8.5.
