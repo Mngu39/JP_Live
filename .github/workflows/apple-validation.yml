@@ -21,6 +21,8 @@ jobs:
     timeout-minutes: ${{ inputs.phase == '2' && 120 || 45 }}
     steps:
       - uses: actions/checkout@v4
+      - name: Verify checked-out source matches release ZIP
+        run: python3 -B Tools/source_checksums.py verify . SHA256SUMS.txt
       - name: Install Metal Toolchain for Phase 2
         if: inputs.phase == '2'
         run: xcodebuild -downloadComponent MetalToolchain
