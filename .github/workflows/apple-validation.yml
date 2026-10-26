@@ -7,10 +7,16 @@ on:
         type: choice
         options: ['1', '2']
         default: '1'
+      phase2_mode:
+        description: Phase 2 full validation or Swift compile smoke only
+        type: choice
+        options: ['full', 'compile-only']
+        default: 'full'
 permissions:
   contents: read
 jobs:
   validate:
+    if: inputs.phase != '2' || inputs.phase2_mode == 'full'
     runs-on: ${{ inputs.phase == '2' && 'xcode-27' || 'macos-26' }}
     timeout-minutes: ${{ inputs.phase == '2' && 120 || 45 }}
     steps:
@@ -70,7 +76,10 @@ jobs:
       - name: Install Metal Toolchain
         run: xcodebuild -downloadComponent MetalToolchain
       - name: Build required Sudachi native framework
-        run: bash Tools/build-sudachi-macos.sh
+        run: |
+          set -euo pipefail
+          mkdir -p BuildOutputs/compile-smoke
+          bash Tools/build-sudachi-macos.sh 2>&1 | tee BuildOutputs/compile-smoke/sudachi-build.log
       - name: Prepare explicitly nonfunctional placeholder model resources
         run: |
           set -euo pipefail
