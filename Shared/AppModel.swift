@@ -10,6 +10,7 @@ final class AppModel: ObservableObject {
         var start: Double
         var end: Double
         var finalizedThrough: Double? = nil
+        var timedSpans: [TimedTextSpan] = []
     }
 
     private struct DraftTranslationRequest {
@@ -22,7 +23,6 @@ final class AppModel: ObservableObject {
 
     @Published var language: SourceLanguage = .japanese
     @Published private var transcript = TranscriptBuffer()
-    private var revisionTranscript = TranscriptBuffer()
     var captions: [Caption] { transcript.rows }
     private var captionIndices: [UUID: Int] = [:]
     @Published var status = "시스템 오디오를 시작하세요."
@@ -47,6 +47,13 @@ final class AppModel: ObservableObject {
     private var timerTask: Task<Void, Never>?
     private var speechTimeline = SpeechTimeline()
     private var speakerHints = SoftSpeakerMapper()
+    private var currentSpeakerIdentityEpoch: Int?
+    private var speakerMappingEpochStart: Double?
+    private var liveDiarizationConnected = false
+    private var pendingLiveAnalysis: (any SpeechAnalysisProvider)?
+    private var liveAnalysisStatus = "화자 분석 준비 전"
+    private var primarySpeechTrace: [SpeechResultTrace] = []
+    private var diarizationDiagnostics = DiarizationDiagnostics()
     private var audioThrough: Double?
     private let morphology = MorphologyWorker()
     private var retokenizationTask: Task<Void, Never>?
@@ -60,10 +67,12 @@ final class AppModel: ObservableObject {
     private let draftTranslationInterval: Double = 0.35
     private let primaryVolatileDebounce: Double = 0.15
     private let speechSourceTimeTolerance: Double = 1.0 / 48000
-    private var bufferedPrimaryVolatile: BufferedSpeechResult?
+    // SpeechTranscriber may keep more than one disjoint volatile source range alive
+    // while resultsFinalizationTime advances separately. Keep those ranges in source
+    // order; a single debounce slot can silently erase an earlier phrase.
+    private var bufferedPrimaryResults: [BufferedSpeechResult] = []
+    private var presentedPrimaryRange: (start: Double, end: Double)?
     private var primaryVolatileTask: Task<Void, Never>?
-    private(set) var qualityRevisionCount = 0
-    private var consumedQualityRevisionIDs: Set<UUID> = []
     var hasFailedTranslations: Bool { !translationJobs.failedIDs(language: language).isEmpty }
     private var languageChangeID = UUID()
 
@@ -114,10 +123,17 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func learningScreenshot() async -> [String: Any]? {
+    func learningScreenshot(for caption: Caption) async -> [String: Any]? {
         #if PHASE2
-        guard let systemInput = input as? SystemAudioInput else { return nil }
-        return try? await systemInput.captureLearningScreenshot()
+        guard ScreenshotCapturePolicy.matches(caption: caption.captureID, current: captureID, running: running),
+              let systemInput = input as? SystemAudioInput else { return nil }
+        // Preserve the precise source instance; a Stop/Start may replace it
+        // while ScreenCaptureKit is awaiting the one-frame screenshot.
+        guard let screenshot = try? await systemInput.captureLearningScreenshot(
+                  matchingSentenceStart: caption.semanticStart, end: caption.semanticEnd),
+              ScreenshotCapturePolicy.matches(caption: caption.captureID, current: captureID, running: running),
+              let currentInput = input as? SystemAudioInput, currentInput === systemInput else { return nil }
+        return screenshot
         #else
         return nil
         #endif
@@ -167,11 +183,13 @@ final class AppModel: ObservableObject {
         let thisCapture = captureID
         let sourceLanguage = language
         transcript.begin(captureID: thisCapture, language: sourceLanguage)
-        revisionTranscript.begin(captureID: thisCapture, language: sourceLanguage)
-        primaryVolatileTask?.cancel(); primaryVolatileTask = nil; bufferedPrimaryVolatile = nil
-        qualityRevisionCount = 0
-        consumedQualityRevisionIDs.removeAll(keepingCapacity: true)
-        speechTimeline = SpeechTimeline(); speakerHints = SoftSpeakerMapper(); audioThrough = nil
+        primaryVolatileTask?.cancel(); primaryVolatileTask = nil; bufferedPrimaryResults.removeAll(keepingCapacity: true); presentedPrimaryRange = nil
+        speechTimeline = SpeechTimeline(); speakerHints = SoftSpeakerMapper(); currentSpeakerIdentityEpoch = nil; speakerMappingEpochStart = nil; audioThrough = nil
+        liveDiarizationConnected = false; pendingLiveAnalysis = nil
+        liveAnalysisStatus = "화자 분석 준비 중 · 기본 STT 유지"
+        primarySpeechTrace.removeAll(keepingCapacity: true)
+        diarizationDiagnostics = DiarizationDiagnostics(status: liveAnalysisStatus)
+        refreshFeatureStatus()
         draftTranslationRequest = nil; translatedDraftSources.removeAll(); lastDraftTranslationStartedAt = -Double.greatestFiniteMagnitude
         // Required STT/input share one lifetime. Optional loading has a separate
         // per-capture mailbox, closed without waiting for downloads during stop.
@@ -184,45 +202,54 @@ final class AppModel: ObservableObject {
     private func run(_ newInput: any AudioInput, capture: UUID, language: SourceLanguage) async {
         let startedAt = ProcessInfo.processInfo.systemUptime
         let pipeline = AudioPreprocessor()
-        let revisionPipeline = AudioPreprocessor(analysisPolicy: .qualityRevision)
         let speech = AppleSpeechEngine()
+        // Speaker attribution is a live metadata path. Model preparation does
+        // not block the Primary PCM loop.
+        let liveAnalysisPreparation = OptionalProviderPreparation(serializeAnalysisPreparation: true)
+        await liveAnalysisPreparation.startAvailable(analysis: true, enhancement: false)
         #if PHASE2
-        separation = LiveSeparationPass { [weak self] original, rows in
-            guard let self, self.captureID == capture else { return false }
-            let ids = self.transcript.applySeparation(original: original, separated: rows)
-            guard !ids.isEmpty else { return false }
-            self.translationJobs.invalidate([original.id])
-            self.translatedDraftSources[original.id] = nil
-            self.morphologyTasks.removeValue(forKey: original.id)?.cancel()
-            self.morphologyRequests[original.id] = nil; self.morphologySources[original.id] = nil
+        separation = LiveSeparationPass(
+            currentRows: { [weak self] in
+                guard let self, self.captureID == capture else { return [] }
+                return Array(self.captions.suffix(32).filter { $0.captureID == capture })
+            },
+            currentTimeline: { [weak self] in
+                guard let self, self.captureID == capture else { return SpeechTimeline() }
+                return self.speechTimeline
+            },
+            deliver: { [weak self] original, target, rows in
+            guard let self, self.captureID == capture else { return [] }
+            let ids = self.transcript.applySeparation(original: original, target: target, separated: rows)
+            guard !ids.isEmpty else { return [] }
+            // Every visual segment belongs to one semantic sentence. Invalidate all old
+            // per-row work, then enqueue sentence translation only for the semantic anchor.
+            self.translationJobs.invalidate(Array(Set(ids + [original.id])))
+            for id in Set(ids + [original.id]) {
+                self.translatedDraftSources[id] = nil
+                self.morphologyTasks.removeValue(forKey: id)?.cancel()
+                self.morphologyRequests[id] = nil; self.morphologySources[id] = nil
+            }
             self.captionIndices.removeAll(keepingCapacity: true)
             self.enqueueTranslations(ids, language: language); self.scheduleMorphology(ids)
-            return true
-        }
+            return ids
+        }, remap: { [weak self] ids, mapping in
+            guard let self, self.captureID == capture else { return }
+            if self.transcript.applySeparationLaneMapping(ids: ids, mapping: mapping) {
+                self.refreshSpeakerPresentation()
+            }
+        })
         separationDiagnostics = separation?.diagnostics ?? SeparationDiagnostics()
         #endif
-        let quality = QualitySpeechPass(pipeline: revisionPipeline, language: language,
-            result: { [weak self] text, final, start, end, finalizedThrough in
-                guard let self, self.captureID == capture else { return }
-                let ready = self.revisionTranscript.receive(text, final: final, start: start, end: end,
-                    speaker: self.speechTimeline.speaker(start: start, end: end),
-                    now: ProcessInfo.processInfo.systemUptime, finalizedThrough: finalizedThrough)
-                self.applyQualityRevisions(ready, language: language)
-            }, output: { [weak self] chunk in
-                guard let self, self.captureID == capture else { return }
-                self.rememberRevisionAudio(chunk)
-            }, status: { [weak self] message in
-                guard let self, self.captureID == capture else { return }
-                if self.featureStatus != message { self.featureStatus = message }
-            })
         var inputFailure: Error?
         do {
             try Task.checkCancellation()
             status = "Apple STT 준비 중…"
-            try await speech.prepare(language: language, result: { [weak self] text, final, start, end, finalizedThrough in
+            try await speech.prepare(language: language, result: { [weak self] text, final, start, end, finalizedThrough, timedSpans in
                 guard let self, self.captureID == capture else { return }
+                self.recordPrimarySpeech(text: text, final: final, start: start, end: end,
+                                         finalizedThrough: finalizedThrough, timedSpans: timedSpans)
                 self.receivePrimarySpeech(.init(text: text, final: final, start: start, end: end,
-                    finalizedThrough: finalizedThrough), language: language)
+                    finalizedThrough: finalizedThrough, timedSpans: timedSpans), language: language)
             }, failure: { [weak self] message in
                 guard let self, self.captureID == capture else { return }
                 self.status = "STT 오류: " + message
@@ -236,13 +263,30 @@ final class AppModel: ObservableObject {
                     do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
                     guard let self, self.captureID == capture else { return }
                     let inputProgress = newInput.progress?.snapshot() ?? AudioInputSnapshot()
-                    quality.observeFastBacklog(inputProgress.pendingAudio)
-                    self.liveDiagnostics = LivePipelineDiagnostics(input: inputProgress, quality: quality.diagnostics,
-                        qualityRevisions: self.qualityRevisionCount, captionCount: self.captions.count,
-                        elapsed: ProcessInfo.processInfo.systemUptime - startedAt)
-                    let analysisUpdates = await revisionPipeline.takeAnalysisUpdates()
+
+                    // Install live diarization only after its model is prepared. This runs
+                    // beside the Primary STT path; the Primary pipeline remains realtime
+                    // and never waits for analysis metadata.
+                    let liveReady = await liveAnalysisPreparation.takeReady()
+                    guard !Task.isCancelled, self.captureID == capture else { return }
+                    if let analysis = liveReady.analysis {
+                        // Handoff only. The serial PCM loop performs the one-time install
+                        // between process calls so provider state cannot be swapped by a
+                        // concurrently re-entrant AudioPreprocessor call.
+                        self.pendingLiveAnalysis = analysis
+                        self.liveAnalysisStatus = "화자 분석 준비됨 · 다음 PCM부터 연결"
+                        self.diarizationDiagnostics.status = self.liveAnalysisStatus
+                    } else if !self.liveDiarizationConnected && self.pendingLiveAnalysis == nil {
+                        self.liveAnalysisStatus = liveReady.analysisStatus
+                        self.diarizationDiagnostics.status = liveReady.analysisStatus
+                    }
+                    self.refreshFeatureStatus()
+
+                    let analysisUpdates = await pipeline.takeAnalysisUpdates()
                     guard !Task.isCancelled, self.captureID == capture else { return }
                     self.applyAnalysisUpdates(analysisUpdates)
+                    self.liveDiagnostics = self.makeLiveDiagnostics(input: inputProgress,
+                        elapsed: ProcessInfo.processInfo.systemUptime - startedAt)
                     let activityEnd = self.speechTimeline.latestEnd.map { min($0, self.audioThrough ?? $0) }
                     let activity = activityEnd.flatMap { self.speechTimeline.activity(through: $0) }
                     let now = ProcessInfo.processInfo.systemUptime
@@ -250,41 +294,68 @@ final class AppModel: ObservableObject {
                     self.enqueueTranslations(ready, language: language)
                     self.queueDraftTranslation(language: language)
                     self.scheduleMorphology(ready + [self.transcript.draftRowID].compactMap { $0 })
-                    let revisionReady = self.revisionTranscript.tick(now: now, activity: activity)
-                    self.applyQualityRevisions(revisionReady, language: language)
-                    self.separation?.consider(Array(self.captions.suffix(32).filter { $0.captureID == capture }),
-                        timeline: self.speechTimeline, fastBacklog: inputProgress.pendingAudio)
+                    self.separation?.consider(fastBacklog: inputProgress.pendingAudio)
                     if let separation = self.separation { self.separationDiagnostics = separation.diagnostics }
                 }
             }
             for try await chunk in sequence {
                 try Task.checkCancellation()
+                if let prepared = pendingLiveAnalysis {
+                    pendingLiveAnalysis = nil
+                    await pipeline.installPrepared(analysis: prepared, enhancement: nil)
+                    try Task.checkCancellation()
+                    liveDiarizationConnected = true
+                    liveAnalysisStatus = "화자 분석 연결됨 · 실시간 메타데이터"
+                    diarizationDiagnostics.status = liveAnalysisStatus
+                    refreshFeatureStatus()
+                }
                 let (processed, value) = try await pipeline.process(chunk)
                 metrics = value
+                if let analysisWarning = value.warnings.last(where: { $0.contains("화자 분석") }) {
+                    liveAnalysisStatus = analysisWarning
+                    diarizationDiagnostics.status = analysisWarning
+                    refreshFeatureStatus()
+                }
                 for output in processed { rememberAudio(output); try speech.append(output) }
                 newInput.progress?.processed(chunk)
-                // Synchronous bounded enqueue only. Model preparation, enhancement,
-                // second STT and their failures never suspend this fast input loop.
-                #if PHASE2
-                if quality.hasStarted || !processed.isEmpty { quality.offer(chunk) }
-                #endif
             }
         } catch {
             if !(error is CancellationError) { inputFailure = error; status = error.localizedDescription }
         }
+        // Natural EOF can arrive after the loader became ready but before another PCM
+        // iteration had a chance to install it. Do one final mailbox handoff so the
+        // retained ring is still backfilled instead of discarding all short-capture
+        // diarization merely because there was no "next chunk". Manual Stop never waits.
+        if !Task.isCancelled && inputFailure == nil {
+            let finalReady = await liveAnalysisPreparation.takeReady()
+            if pendingLiveAnalysis == nil { pendingLiveAnalysis = finalReady.analysis }
+            if let prepared = pendingLiveAnalysis {
+                pendingLiveAnalysis = nil
+                await pipeline.installPrepared(analysis: prepared, enhancement: nil)
+                liveDiarizationConnected = true
+                liveAnalysisStatus = "화자 분석 연결됨 · EOF 백필"
+                diarizationDiagnostics.status = liveAnalysisStatus
+                refreshFeatureStatus()
+            }
+        }
         timerTask?.cancel(); timerTask = nil
-        // Manual stop/error cancels optional work immediately. Natural EOF
+        // Closing the per-capture live loader prevents any late model preparation from
+        // attaching after Stop/EOF. Installed analysis is owned by `pipeline` and drains
+        // normally on natural EOF. Stop never waits for a model download.
+        await liveAnalysisPreparation.cancel()
+        pendingLiveAnalysis = nil
+        // Manual stop/error cancels overlap processing immediately. Natural EOF
         // keeps its PCM window until the final STT and analysis rows arrive.
         if Task.isCancelled || inputFailure != nil { separation?.stop() }
         await newInput.stop()
+        let nativeStopFailure = newInput.stopFailure
         // Cleanup runs in a fresh task: cancelling the input loop must not also
         // cancel final conversion/STT finalization of already-accepted audio.
         let wasCancelled = Task.isCancelled
         // User Stop intentionally discards the screen/history immediately afterward.
-        // Do not make it wait for accepted primary PCM or any optional correction pass.
+        // Do not wait for accepted PCM on manual Stop.
         // Natural EOF still drains accepted audio so file/stream completion can finalize text.
         let drainAcceptedAudio = inputFailure == nil && !wasCancelled
-        if wasCancelled || inputFailure != nil { await quality.finish(aborting: true) }
         let cleanup = Task { @MainActor () -> String? in
             do {
                 if drainAcceptedAudio {
@@ -306,25 +377,19 @@ final class AppModel: ObservableObject {
             }
         }
         let cleanupFailure = await cleanup.value
-        await quality.finish(aborting: wasCancelled || inputFailure != nil || cleanupFailure != nil)
         if !wasCancelled {
-            applyAnalysisUpdates(await revisionPipeline.takeAnalysisUpdates())
-            let revisionReady = revisionTranscript.finish()
-            applyQualityRevisions(revisionReady, language: language)
+            // `pipeline.finish()` waits for live diarization to finish accepted PCM, so
+            // this is the final authoritative speaker metadata drain for the capture.
+            applyAnalysisUpdates(await pipeline.takeAnalysisUpdates())
         }
-        if inputFailure == nil, let cleanupFailure { status = cleanupFailure }
+        if let nativeStopFailure { status = nativeStopFailure }
+        else if inputFailure == nil, let cleanupFailure { status = cleanupFailure }
         let ready = finishPrimaryTranscript(language: language)
         enqueueTranslations(ready, language: language); queueDraftTranslation(language: language)
-        if !wasCancelled {
-            for revised in revisionTranscript.rows.suffix(8) where revised.isFinal {
-                applyQualityCaption(revised, language: language)
-            }
-        }
         scheduleMorphology(ready + captions.suffix(1).map(\.id))
         if let separation {
             if !Task.isCancelled && inputFailure == nil && cleanupFailure == nil {
-                await separation.finish(rows: Array(captions.suffix(32).filter { $0.captureID == capture }),
-                                        timeline: speechTimeline)
+                await separation.finish()
             } else {
                 separation.stop()
             }
@@ -332,159 +397,270 @@ final class AppModel: ObservableObject {
         }
         separation = nil
         input = nil
-        if Task.isCancelled && inputFailure == nil && cleanupFailure == nil { status = "입력 중지" }
+        if Task.isCancelled && inputFailure == nil && cleanupFailure == nil && nativeStopFailure == nil {
+            status = "입력 중지"
+        }
         else if status == "듣는 중" { status = "입력 완료" }
         running = false
-        liveDiagnostics = LivePipelineDiagnostics(input: newInput.progress?.snapshot() ?? AudioInputSnapshot(),
-            quality: quality.diagnostics, qualityRevisions: qualityRevisionCount, captionCount: captions.count,
+        liveDiagnostics = makeLiveDiagnostics(input: newInput.progress?.snapshot() ?? AudioInputSnapshot(),
             elapsed: ProcessInfo.processInfo.systemUptime - startedAt)
     }
 
     func finishPrimaryTranscript(language: SourceLanguage) -> [UUID] {
         primaryVolatileTask?.cancel(); primaryVolatileTask = nil
-        let latest = bufferedPrimaryVolatile; bufferedPrimaryVolatile = nil
-        // EOF may beat the 150 ms UI debounce. Preserve the latest tentative
-        // result before finish marks it unconfirmed; Clear/final already revoke it.
-        if let latest { applyPrimarySpeech(latest, language: language) }
+        // Commit any leading ranges that Apple explicitly finalized. If an earlier
+        // range is still tentative, later ranges cannot safely leapfrog it in
+        // TranscriptBuffer; preserve the remaining source-order text as one
+        // unconfirmed EOF draft instead of dropping all but the last callback.
+        drainPrimaryQueue(language: language)
+        if !bufferedPrimaryResults.isEmpty {
+            let aggregate = aggregateBufferedPrimaryResults(language: language)
+            bufferedPrimaryResults.removeAll(keepingCapacity: true)
+            presentedPrimaryRange = nil
+            if let aggregate { applyPrimarySpeech(aggregate, language: language) }
+        }
         return transcript.finish()
     }
 
     func receivePrimarySpeech(_ result: BufferedSpeechResult, language: SourceLanguage) {
         let trimmed = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // The 150 ms UI debounce must never erase a previous phrase that Apple has
-        // already finalized only through resultsFinalizationTime. If a newer, disjoint
-        // callback advances the frontier past the buffered phrase, feed that phrase to
-        // TranscriptBuffer before replacing the one-slot visual debounce buffer. The
-        // incoming callback will then let TranscriptBuffer promote it by source time.
-        flushBufferedPrimaryIfFinalized(by: result, language: language)
-
-        if result.final {
-            primaryVolatileTask?.cancel(); primaryVolatileTask = nil; bufferedPrimaryVolatile = nil
-            applyPrimarySpeech(result, language: language)
-            return
-        }
         if trimmed.isEmpty {
-            // Empty volatile results are semantic revocations in SpeechTranscriber, not
-            // merely another visual draft. Apply them immediately so the 150 ms display
-            // debounce cannot lose a revocation when a later callback arrives. Cancel a
-            // buffered visual hypothesis only when this revocation targets that same range.
-            if let buffered = bufferedPrimaryVolatile {
-                let sameStart = abs(buffered.start-result.start) <= speechSourceTimeTolerance
-                let overlaps = result.start < buffered.end && result.end > buffered.start
-                if sameStart || overlaps {
-                    primaryVolatileTask?.cancel(); primaryVolatileTask = nil; bufferedPrimaryVolatile = nil
-                }
+            let removedPresented = presentedPrimaryRange.map { rangesOverlap($0.start, $0.end, result.start, result.end) } ?? false
+            bufferedPrimaryResults.removeAll { rangesOverlap($0.start, $0.end, result.start, result.end) }
+            if removedPresented {
+                primaryVolatileTask?.cancel(); primaryVolatileTask = nil
+                presentedPrimaryRange = nil
+                applyPrimarySpeech(result, language: language)
             }
-            applyPrimarySpeech(result, language: language)
+            markPrimaryFinalized(through: result.finalizedThrough)
+            drainPrimaryQueue(language: language)
+            schedulePrimaryDebounce(language: language)
             return
         }
-        bufferedPrimaryVolatile = result
-        guard primaryVolatileTask == nil else { return }
-        let debounceMilliseconds = Int(primaryVolatileDebounce * 1000)
-        primaryVolatileTask = Task { [weak self] in
-            do { try await Task.sleep(for: .milliseconds(debounceMilliseconds)) } catch { return }
-            guard let self else { return }
-            let latest = self.bufferedPrimaryVolatile
-            self.bufferedPrimaryVolatile = nil
-            self.primaryVolatileTask = nil
-            if let latest { self.applyPrimarySpeech(latest, language: language) }
+
+        // Replace only the recognizer hypothesis for the same/overlapping source
+        // range. Disjoint volatile ranges coexist until their finalization frontier
+        // advances; this is the state a one-slot debounce could not represent.
+        var replacedPresented = false
+        bufferedPrimaryResults.removeAll { existing in
+            let sameStart = abs(existing.start-result.start) <= speechSourceTimeTolerance
+            let overlaps = rangesOverlap(existing.start, existing.end, result.start, result.end)
+            if sameStart || overlaps {
+                if let shown = presentedPrimaryRange, rangesOverlap(shown.start, shown.end, existing.start, existing.end) {
+                    replacedPresented = true
+                }
+                return true
+            }
+            return false
+        }
+        if replacedPresented {
+            primaryVolatileTask?.cancel(); primaryVolatileTask = nil
+            presentedPrimaryRange = nil
+        }
+        bufferedPrimaryResults.append(result)
+        bufferedPrimaryResults.sort { lhs, rhs in
+            if abs(lhs.start-rhs.start) > speechSourceTimeTolerance { return lhs.start < rhs.start }
+            return lhs.end < rhs.end
+        }
+        markPrimaryFinalized(through: result.finalizedThrough)
+        drainPrimaryQueue(language: language)
+        schedulePrimaryDebounce(language: language)
+    }
+
+    private func markPrimaryFinalized(through frontier: Double?) {
+        guard let frontier, frontier.isFinite else { return }
+        for index in bufferedPrimaryResults.indices where bufferedPrimaryResults[index].end <= frontier + speechSourceTimeTolerance {
+            bufferedPrimaryResults[index].final = true
         }
     }
 
-    private func flushBufferedPrimaryIfFinalized(by incoming: BufferedSpeechResult, language: SourceLanguage) {
-        guard let buffered = bufferedPrimaryVolatile,
-              let frontier = incoming.finalizedThrough, frontier.isFinite,
-              buffered.end <= frontier + speechSourceTimeTolerance else { return }
-        let sameStart = abs(buffered.start-incoming.start) <= speechSourceTimeTolerance
-        let overlaps = incoming.start < buffered.end && incoming.end > buffered.start
-        guard !sameStart && !overlaps else { return }
-        primaryVolatileTask?.cancel(); primaryVolatileTask = nil; bufferedPrimaryVolatile = nil
-        applyPrimarySpeech(buffered, language: language)
+    private func drainPrimaryQueue(language: SourceLanguage) {
+        while let first = bufferedPrimaryResults.first, first.final {
+            var committed = first; committed.final = true
+            applyPrimarySpeech(committed, language: language)
+            bufferedPrimaryResults.removeFirst()
+            if let shown = presentedPrimaryRange, rangesOverlap(shown.start, shown.end, first.start, first.end) {
+                presentedPrimaryRange = nil
+            }
+        }
+    }
+
+    private func schedulePrimaryDebounce(language: SourceLanguage) {
+        guard let first = bufferedPrimaryResults.first, !first.final else { return }
+        if let shown = presentedPrimaryRange,
+           abs(shown.start-first.start) <= speechSourceTimeTolerance,
+           abs(shown.end-first.end) <= speechSourceTimeTolerance { return }
+        primaryVolatileTask?.cancel()
+        let expectedStart = first.start, expectedEnd = first.end
+        let debounceMilliseconds = Int(primaryVolatileDebounce * 1000)
+        primaryVolatileTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(debounceMilliseconds)) } catch { return }
+            guard let self, let current = self.bufferedPrimaryResults.first, !current.final,
+                  abs(current.start-expectedStart) <= self.speechSourceTimeTolerance,
+                  abs(current.end-expectedEnd) <= self.speechSourceTimeTolerance else { return }
+            self.primaryVolatileTask = nil
+            self.applyPrimarySpeech(current, language: language)
+            self.presentedPrimaryRange = (current.start, current.end)
+        }
+    }
+
+    private func aggregateBufferedPrimaryResults(language: SourceLanguage) -> BufferedSpeechResult? {
+        let values = bufferedPrimaryResults.sorted { $0.start < $1.start }
+        guard let first = values.first, let last = values.last else { return nil }
+        var text = ""
+        for value in values {
+            let piece = value.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !piece.isEmpty else { continue }
+            if language == .english, !text.isEmpty, text.last?.isWhitespace == false, piece.first?.isWhitespace == false { text += " " }
+            text += piece
+        }
+        guard !text.isEmpty else { return nil }
+        return BufferedSpeechResult(text: text, final: false, start: first.start, end: last.end,
+                                    finalizedThrough: nil, timedSpans: [])
+    }
+
+    private func rangesOverlap(_ aStart: Double, _ aEnd: Double, _ bStart: Double, _ bEnd: Double) -> Bool {
+        aStart < bEnd-speechSourceTimeTolerance && bStart < aEnd-speechSourceTimeTolerance
     }
 
     private func applyPrimarySpeech(_ result: BufferedSpeechResult, language: SourceLanguage) {
         let ready = transcript.receive(result.text, final: result.final, start: result.start, end: result.end,
             speaker: speechTimeline.speaker(start: result.start, end: result.end),
-            now: ProcessInfo.processInfo.systemUptime, finalizedThrough: result.finalizedThrough)
+            now: ProcessInfo.processInfo.systemUptime, finalizedThrough: result.finalizedThrough,
+            timedSpans: result.timedSpans)
         enqueueTranslations(ready, language: language)
         queueDraftTranslation(language: language)
         scheduleMorphology(ready + [transcript.draftRowID].compactMap { $0 })
-        if !ready.isEmpty {
-            // A quality sentence can arrive before the fast path has sealed its row.
-            // Retry only the recent hidden finals when a new visible sentence appears.
-            for revised in revisionTranscript.rows.suffix(8) where revised.isFinal {
-                applyQualityCaption(revised, language: language)
-            }
-        }
-    }
-
-    private func applyQualityRevisions(_ ids: [UUID], language: SourceLanguage) {
-        for id in ids {
-            guard let revised = revisionTranscript.rows.first(where: { $0.id == id && $0.isFinal }) else { continue }
-            applyQualityCaption(revised, language: language)
-        }
-        if revisionTranscript.rows.count > 32 {
-            let excess = revisionTranscript.rows.count - 32
-            let removed = revisionTranscript.rows.prefix(excess).map(\.id)
-            revisionTranscript.rows.removeFirst(excess)
-            consumedQualityRevisionIDs.subtract(removed)
-        }
-    }
-
-    private func applyQualityCaption(_ revised: Caption, language: SourceLanguage) {
-        guard !consumedQualityRevisionIDs.contains(revised.id) else { return }
-        switch transcript.resolveRevision(revised) {
-        case .pending:
-            // The fast path has not sealed the exact source interval yet. Retry once a
-            // newer primary final arrives, but never replay a revision after it was decided.
-            return
-        case .rejected:
-            consumedQualityRevisionIDs.insert(revised.id)
-            return
-        case .applied(let effect):
-            consumedQualityRevisionIDs.insert(revised.id)
-            qualityRevisionCount += 1
-            let invalid = [effect.updatedID] + effect.removedIDs
-            translationJobs.invalidate(invalid)
-            translatedDraftSources[effect.updatedID] = nil
-            for removed in effect.removedIDs {
-                translatedDraftSources[removed] = nil
-                morphologyTasks.removeValue(forKey: removed)?.cancel()
-                morphologyRequests[removed] = nil; morphologySources[removed] = nil
-            }
-            enqueueTranslations([effect.updatedID], language: language)
-            scheduleMorphology([effect.updatedID])
-        }
-    }
-
-    private func rememberRevisionAudio(_ output: PCMChunk) {
-        let end = output.time + Double(output.buffer.frameLength)/output.buffer.format.sampleRate
-        if var decision = output.decision {
-            decision.start = output.time; decision.end = end
-            applyAnalysisUpdates([decision])
-        }
     }
 
     private func rememberAudio(_ output: PCMChunk) {
         separation?.offer(output)
         let end = output.time + Double(output.buffer.frameLength)/output.buffer.format.sampleRate
         audioThrough = end
-        if var decision = output.decision {
-            decision.start = output.time; decision.end = end
-            applyAnalysisUpdates([decision])
-        }
+        // Render-time decisions are leveler metadata only. Authoritative speaker history
+        // comes exclusively from takeAnalysisUpdates(); otherwise a current render slice
+        // can enter the append-only global timeline before delayed backfill and erase it.
     }
 
     private func applyAnalysisUpdates(_ decisions: [SpeechDecision]) {
-        guard !decisions.isEmpty else { return }
-        speechTimeline.append(decisions)
-        let changed = transcript.applySpeakerTimeline(speechTimeline)
-        for id in changed {
-            guard let index = captionIndex(id, matching: { $0.id == id && $0.isFinal }) else { continue }
-            let row = transcript.rows[index]
-            transcript.rows[index].gutterHint = speakerHints.hint(for: row)
+        let valid = decisions.filter(\.isValid)
+        guard !valid.isEmpty else { return }
+        recordDiarization(valid)
+        let previousTimelineEnd = speechTimeline.latestEnd
+        speechTimeline.append(valid)
+        // LS-EEND slot numbers are only meaningful inside one recurrent-state epoch.
+        // A recovery/reset deliberately renews that namespace; do not let the old
+        // two-track presentation mapper assign a post-reset slot the opposite tint.
+        if let newestEpoch = valid.last?.identityEpoch, currentSpeakerIdentityEpoch != newestEpoch {
+            if currentSpeakerIdentityEpoch != nil {
+                speakerHints = SoftSpeakerMapper()
+                if let firstNew = valid.first(where: { $0.identityEpoch == newestEpoch })?.start {
+                    speakerMappingEpochStart = max(previousTimelineEnd ?? firstNew, firstNew)
+                } else { speakerMappingEpochStart = previousTimelineEnd }
+            }
+            currentSpeakerIdentityEpoch = newestEpoch
         }
+        _ = transcript.applySpeakerTimeline(speechTimeline)
+        refreshSpeakerPresentation()
+    }
+
+    // Speaker evidence may arrive after the caption. First let recent final rows teach the
+    // two-track presentation mapper; once both tracks are confirmed, recolor the same
+    // recent rows retroactively. Separator lanes use global colors only when a
+    // non-overlap live-diarizer anchor mapped that local lane to a real speaker slot.
+    private func refreshSpeakerPresentation() {
+        let minimumEnd = speakerMappingEpochStart.map { $0 + speechSourceTimeTolerance }
+        let indices = transcript.recentFinalSpeakerRowIndices(captureID: captureID, minimumEnd: minimumEnd)
+        for index in indices where transcript.rows[index].separationGroup == nil {
+            _ = speakerHints.hint(for: transcript.rows[index])
+        }
+        for index in indices {
+            let row = transcript.rows[index]
+            let hint: SpeakerGutterHint
+            if row.separationGroup != nil {
+                hint = row.speaker.map { speakerHints.resolvedHint(slot: $0) } ?? .mixed
+                if transcript.rows[index].gutterHint != hint {
+                    transcript.rows[index].gutterHint = hint
+                    transcript.rows[index].revision += 1
+                }
+                continue
+            }
+            let spanSlots = Set(row.speakerSpans.compactMap(\.speaker))
+            let spanEpochs = Set(row.speakerSpans.map(\.identityEpoch))
+            if row.speakerSpans.contains(where: { $0.overlap }) || spanSlots.count > 1 ||
+                spanEpochs.count > 1 ||
+                (row.speaker == nil && spanSlots.isEmpty &&
+                 speechTimeline.hasMultipleSpeakersOrOverlap(start: row.start, end: row.end)) {
+                hint = .mixed
+            } else {
+                hint = speakerHints.resolvedHint(slot: row.speaker ?? spanSlots.first)
+            }
+            if transcript.rows[index].gutterHint != hint {
+                transcript.rows[index].gutterHint = hint
+                transcript.rows[index].revision += 1
+            }
+        }
+    }
+
+    private func recordPrimarySpeech(text: String, final: Bool, start: Double, end: Double,
+                                     finalizedThrough: Double?, timedSpans: [TimedTextSpan]) {
+        appendSpeechTrace(&primarySpeechTrace, text: text, final: final, start: start, end: end,
+                          finalizedThrough: finalizedThrough, timedSpans: timedSpans)
+    }
+
+    private func appendSpeechTrace(_ trace: inout [SpeechResultTrace], text: String, final: Bool,
+                                   start: Double, end: Double, finalizedThrough: Double?,
+                                   timedSpans: [TimedTextSpan]) {
+        trace.append(.init(text: text, final: final, start: start, end: end,
+                           finalizedThrough: finalizedThrough, timedSpans: timedSpans))
+        if trace.count > 48 { trace.removeFirst(trace.count-48) }
+    }
+
+    private func recordDiarization(_ decisions: [SpeechDecision]) {
+        let valid = decisions.filter(\.isValid)
+        guard !valid.isEmpty else { return }
+        diarizationDiagnostics.status = "화자 분석 동작 중"
+        diarizationDiagnostics.analysisActivatedAt = diarizationDiagnostics.analysisActivatedAt ?? valid.first?.start
+        diarizationDiagnostics.updateCount += valid.count
+        diarizationDiagnostics.singleSpeakerFrames += valid.filter {
+            $0.speechProbability >= 0.60 && $0.activeSpeakers == 1 && $0.speakerSlot != nil
+        }.count
+        diarizationDiagnostics.overlapFrames += valid.filter {
+            $0.speechProbability >= 0.60 && $0.activeSpeakers >= 2
+        }.count
+        var slots = Set(diarizationDiagnostics.distinctSpeakerSlots)
+        slots.formUnion(valid.compactMap {
+            $0.speechProbability >= 0.60 && $0.activeSpeakers == 1 ? $0.speakerSlot : nil
+        })
+        diarizationDiagnostics.distinctSpeakerSlots = slots.sorted()
+        diarizationDiagnostics.latestEnd = max(diarizationDiagnostics.latestEnd ?? 0, valid.map(\.end).max() ?? 0)
+        diarizationDiagnostics.recentFrames += valid.map {
+            DiarizationFrameTrace(speechProbability: $0.speechProbability, activeSpeakers: $0.activeSpeakers,
+                                  start: $0.start, end: $0.end, speakerSlot: $0.speakerSlot,
+                                  identityEpoch: $0.identityEpoch)
+        }
+        if diarizationDiagnostics.recentFrames.count > 96 {
+            diarizationDiagnostics.recentFrames.removeFirst(diarizationDiagnostics.recentFrames.count-96)
+        }
+    }
+
+    private func refreshFeatureStatus() {
+        let value = liveAnalysisStatus
+        if featureStatus != value { featureStatus = value }
+    }
+
+    private func makeLiveDiagnostics(input: AudioInputSnapshot, elapsed: Double) -> LivePipelineDiagnostics {
+        let displayed = captions.suffix(32).map { row in
+            DisplayedCaptionTrace(text: row.source, final: row.isFinal, start: row.start, end: row.end,
+                speaker: row.speaker, gutter: row.gutterHint.rawValue,
+                separated: row.separationGroup != nil, separationLane: row.separationLane,
+                speakerSpans: row.speakerSpans)
+        }
+        return LivePipelineDiagnostics(input: input,
+            captionCount: captions.count, elapsed: elapsed, primarySpeech: primarySpeechTrace,
+            displayedCaptions: displayed, diarization: diarizationDiagnostics,
+            separation: separationDiagnostics)
     }
 
     private func scheduleMorphology(_ ids: [UUID]) {
@@ -535,9 +711,9 @@ final class AppModel: ObservableObject {
         let capturedThrough = input?.progress?.snapshot().capturedThrough
         let clearThrough = Self.clearWatermark(processedThrough: audioThrough, capturedThrough: capturedThrough)
         transcript.clearDisplay(through: clearThrough)
-        revisionTranscript.clearDisplay(through: clearThrough)
-        consumedQualityRevisionIDs.removeAll(keepingCapacity: true)
-        primaryVolatileTask?.cancel(); primaryVolatileTask = nil; bufferedPrimaryVolatile = nil
+        primarySpeechTrace.removeAll(keepingCapacity: true)
+        liveDiagnostics.primarySpeech = []; liveDiagnostics.displayedCaptions = []
+        primaryVolatileTask?.cancel(); primaryVolatileTask = nil; bufferedPrimaryResults.removeAll(keepingCapacity: true); presentedPrimaryRange = nil; currentSpeakerIdentityEpoch = nil; speakerMappingEpochStart = nil; speakerHints = SoftSpeakerMapper()
         for task in morphologyTasks.values { task.cancel() }
         morphologyTasks.removeAll(); morphologyRequests.removeAll(); morphologySources.removeAll()
         translationJobs = TranslationBacklog()
@@ -571,12 +747,16 @@ final class AppModel: ObservableObject {
         // and multiple length-split rows with the same audio range cannot inflate it.
         for id in ids {
             guard let index = captionIndex(id, matching: { $0.id == id && $0.isFinal }) else { continue }
-            let row = transcript.rows[index]
-            transcript.rows[index].gutterHint = speakerHints.hint(for: row)
+            _ = speakerHints.hint(for: transcript.rows[index])
         }
-        translationJobs.enqueue(ids, language: language)
+        refreshSpeakerPresentation()
+        let translationIDs = ids.compactMap { id -> UUID? in
+            guard let index = captionIndex(id, matching: { $0.id == id && $0.isFinal && $0.isSemanticSentenceAnchor }) else { return nil }
+            return transcript.rows[index].id
+        }
+        translationJobs.enqueue(Array(Set(translationIDs)), language: language)
         if translationPreparationFailed && self.language == language {
-            let pending = Set(ids)
+            let pending = Set(translationIDs)
             for index in captions.indices where pending.contains(transcript.rows[index].id) {
                 transcript.rows[index].translationError = "번역 준비 실패 · 메뉴에서 다시 연결"
             }
@@ -651,10 +831,11 @@ final class AppModel: ObservableObject {
             }
 
             if let id = translationJobs.take(language: sessionLanguage) {
-                guard let row = caption(id, matching: { $0.id == id && $0.isFinal && $0.language == sessionLanguage })
-                else { translationJobs.complete(id); continue }
+                guard let row = caption(id, matching: {
+                    $0.id == id && $0.isFinal && $0.language == sessionLanguage && $0.isSemanticSentenceAnchor
+                }) else { translationJobs.complete(id); continue }
                 do {
-                    let response = try await session.translate(row.source)
+                    let response = try await session.translate(row.semanticSource)
                     if Task.isCancelled || revision != translationRevision {
                         if currentTranslationRow(row) != nil { translationJobs.restore(id, language: sessionLanguage) }
                         return
@@ -669,7 +850,7 @@ final class AppModel: ObservableObject {
                         if currentTranslationRow(row) != nil { translationJobs.restore(id, language: sessionLanguage) }
                         return
                     }
-                    // Quality correction/Clear already invalidated the old job. Its
+                    // A transcript replacement/Clear invalidated the old job. Its
                     // late failure must not change retries or errors of the new source.
                     guard let current = currentTranslationRow(row) else { continue }
                     let retrying = translationJobs.failed(id, language: sessionLanguage, now: ProcessInfo.processInfo.systemUptime)
@@ -723,209 +904,21 @@ final class AppModel: ObservableObject {
     private func currentTranslationRow(_ request: Caption) -> Int? {
         captionIndex(request.id) {
             $0.id == request.id && $0.captureID == request.captureID &&
-            $0.isFinal && $0.language == request.language && $0.source == request.source
-        }
-    }
-}
-
-// MainActor owns delivery state; costly PCM/model work runs on its provider actors.
-// No async method on this object is called from the required input loop.
-@MainActor
-enum QualityWorkLease {
-    private static var owner: UUID?
-    static func acquire(_ id: UUID) -> Bool {
-        guard owner == nil else { return false }
-        owner = id; return true
-    }
-    static func release(_ id: UUID) { if owner == id { owner = nil } }
-}
-
-@MainActor
-final class QualitySpeechPass {
-    private let pipeline: AudioPreprocessor
-    private let language: SourceLanguage
-    private let result: (String, Bool, Double, Double, Double?) -> Void
-    private let output: (PCMChunk) -> Void
-    private let status: (String) -> Void
-    private let speech: any QualitySpeechSink
-    private let optional: OptionalProviderPreparation
-    private var continuation: AsyncStream<PCMChunk>.Continuation?
-    private var task: Task<Void, Never>?
-    private var accepting = false
-    private var closed = false
-    private var budget = QualityAudioBudget()
-    private var observations = QualityPassDiagnostics()
-    private var pressureSince: Double?
-    private var consumerFinished = true
-    private let finishTimeout: TimeInterval
-    var diagnostics: QualityPassDiagnostics {
-        var value = observations; value.backlog = budget.duration; return value
-    }
-    private(set) var hasStarted = false
-    var acceptingInput: Bool { accepting && !closed }
-
-    init(pipeline: AudioPreprocessor, language: SourceLanguage,
-         speech: (any QualitySpeechSink)? = nil,
-         optional: OptionalProviderPreparation = OptionalProviderPreparation(),
-         finishTimeout: TimeInterval = 8,
-         result: @escaping (String, Bool, Double, Double, Double?) -> Void,
-         output: @escaping (PCMChunk) -> Void, status: @escaping (String) -> Void) {
-        self.pipeline = pipeline; self.language = language
-        self.speech = speech ?? AppleSpeechEngine(); self.optional = optional
-        self.finishTimeout = finishTimeout.isFinite && finishTimeout > 0 ? finishTimeout : 8
-        self.result = result; self.output = output; self.status = status
-    }
-
-    func offer(_ chunk: PCMChunk) {
-        guard !closed else { observations.skippedChunks += 1; return }
-        if !hasStarted {
-            hasStarted = true
-            let lease = UUID()
-            guard QualityWorkLease.acquire(lease) else {
-                observations.skippedChunks += 1
-                disable("이전 보정 작업 정리 중 · 이번 실행은 빠른 STT 유지")
-                return
-            }
-            let (stream, input) = AsyncStream<PCMChunk>.makeStream(bufferingPolicy: .bufferingOldest(256))
-            continuation = input
-            consumerFinished = false
-            task = Task(priority: .utility) {
-                defer { QualityWorkLease.release(lease); consumerFinished = true }
-                await consume(stream)
-            }
-        }
-        // Preparation is optional: never buffer an entire model download.
-        guard accepting, let continuation else { observations.skippedChunks += 1; return }
-        let duration = Double(chunk.buffer.frameLength) / chunk.buffer.format.sampleRate
-        guard budget.reserve(duration: duration) else {
-            observations.skippedChunks += 1; observations.overloadStops += 1
-            disable("보정 처리 지연 · 빠른 STT 유지")
-            return
-        }
-        observations.peakBacklog = max(observations.peakBacklog, budget.duration)
-        observations.acceptedThrough = chunk.time + duration
-        switch continuation.yield(chunk) {
-        case .enqueued: break
-        case .dropped, .terminated: disable("보정 입력 종료 · 빠른 STT 유지")
-        @unknown default: disable("보정 입력 상태 오류 · 빠른 STT 유지")
+            $0.isFinal && $0.language == request.language && $0.isSemanticSentenceAnchor &&
+            $0.semanticID == request.semanticID && $0.semanticSource == request.semanticSource
         }
     }
 
-    private func disable(_ message: String) {
-        guard !closed else { return }
-        closed = true; accepting = false
-        observations.stoppedReason = message
-        continuation?.finish(); continuation = nil; task?.cancel()
-        Task { await optional.cancel() }
-        status(message)
-    }
-
-    func observeFastBacklog(_ duration: Double) {
-        guard hasStarted, !closed else { return }
-        let now = ProcessInfo.processInfo.systemUptime
-        if duration < 0.75 { pressureSince = nil; return }
-        if pressureSince == nil { pressureSince = now }
-        if now - (pressureSince ?? now) >= 1 {
-            observations.overloadStops += 1
-            disable("빠른 STT 지연 증가 · 이번 실행의 보정 처리 중단")
+    // Sentence popup may survive an asynchronous overlap replacement because the original
+    // row ID is deliberately retained on the semantic anchor. Word popup/save is stricter:
+    // token offsets belong to one visual source row, so a changed/replaced row invalidates it.
+    func popupCaption(rowID: UUID, captureID: UUID, expectedSource: String, sentenceMode: Bool) -> Caption? {
+        guard let index = captionIndex(rowID, matching: { $0.id == rowID && $0.captureID == captureID }) else { return nil }
+        let current = transcript.rows[index]
+        if !sentenceMode {
+            guard current.source == expectedSource else { return nil }
+            return current
         }
-    }
-
-    private func consume(_ stream: AsyncStream<PCMChunk>) async {
-        var pipelineStarted = false
-        do {
-            await optional.startAvailable()
-            try Task.checkCancellation()
-            try await speech.prepareForQuality(language: language, result: { [weak self] text, final, start, end, finalizedThrough in
-                guard let self, !self.closed else { return }
-                self.observations.recognitionThrough = max(self.observations.recognitionThrough ?? end, end)
-                self.result(text, final, start, end, finalizedThrough)
-            }, failure: { [weak self] message in
-                self?.disable("보정 STT 오류 · 빠른 STT 유지: " + message)
-            })
-            try Task.checkCancellation()
-            accepting = true
-            for await chunk in stream {
-                try Task.checkCancellation()
-                let ready = await optional.takeReady()
-                try Task.checkCancellation()
-                if ready.analysis != nil || ready.enhancement != nil {
-                    await pipeline.installPrepared(analysis: ready.analysis, enhancement: ready.enhancement)
-                    if ready.analysis != nil {
-                        pipelineStarted = true; observations.analysisActivatedAt = chunk.time
-                    }
-                    if ready.enhancement != nil { observations.enhancementActivatedAt = chunk.time }
-                }
-                try Task.checkCancellation()
-                status(ready.status)
-                if pipelineStarted {
-                    let (chunks, _) = try await pipeline.process(chunk)
-                    try Task.checkCancellation()
-                    for value in chunks { try deliver(value) }
-                } else {
-                    observations.skippedChunks += 1
-                }
-                budget.release(duration: Double(chunk.buffer.frameLength) / chunk.buffer.format.sampleRate)
-            }
-            try Task.checkCancellation()
-            if pipelineStarted {
-                let tails = try await pipeline.finish()
-                for value in tails {
-                    try Task.checkCancellation()
-                    try deliver(value)
-                }
-                try await speech.finish(aborting: false)
-            } else {
-                try await speech.finish(aborting: true)
-            }
-        } catch {
-            if !(error is CancellationError) { disable("보정 경로 오류 · 빠른 STT 유지: " + error.localizedDescription) }
-            // Cleanup must not inherit cancellation from the quality worker.
-            let cleanup = Task { @MainActor in
-                await self.pipeline.cancel()
-                do { try await self.speech.finish(aborting: true) }
-                catch { /* The initial quality error is already reported. */ }
-            }
-            await cleanup.value
-        }
-        await optional.cancel()
-        // Cancelled SDK loaders can outlive their capture. Hold the lease until
-        // they really exit, but do not make the user's Stop await those loaders.
-        await optional.waitUntilFinished()
-        closed = true; accepting = false; continuation?.finish(); continuation = nil
-        budget = QualityAudioBudget()
-    }
-
-    private func deliver(_ value: PCMChunk) throws {
-        try speech.append(value)
-        observations.analyzerInputThrough = value.time + Double(value.buffer.frameLength)/value.buffer.format.sampleRate
-        output(value)
-    }
-
-    func finish(aborting: Bool) async {
-        let wasPreparing = hasStarted && !accepting && !closed
-        if aborting || wasPreparing {
-            closed = true; accepting = false; task?.cancel()
-        }
-        continuation?.finish(); continuation = nil
-        await optional.cancel()
-        // A loader/SDK preparation may ignore cancellation. It owns its cleanup,
-        // and closed blocks all late delivery; stopping capture need not await it.
-        if aborting || wasPreparing { return }
-        let deadline = ProcessInfo.processInfo.systemUptime + finishTimeout
-        while !consumerFinished {
-            if Task.isCancelled {
-                disable("입력 중지 · 보정 작업 취소 요청")
-                task?.cancel(); return
-            }
-            if ProcessInfo.processInfo.systemUptime >= deadline {
-                observations.overloadStops += 1
-                disable("입력 종료 후 보정 대기 시간 초과 · 원본 유지")
-                task?.cancel(); return
-            }
-            do { try await Task.sleep(for: .milliseconds(20)) }
-            catch { disable("입력 중지 · 보정 작업 취소 요청"); task?.cancel(); return }
-        }
-        closed = true; accepting = false
+        return PopupSemanticSentence.resolve(current: current, rows: transcript.rows, currentIndex: index)
     }
 }

@@ -18,6 +18,13 @@ struct PopupSelection: Identifiable {
     let id = UUID()
     let row: Caption
     let token: WordToken?
+    var sentenceMode: Bool { token == nil }
+}
+
+private struct CaptionDisplayGroup: Identifiable {
+    let id: UUID
+    var rows: [Caption]
+    var anchor: Caption { rows.first(where: \.isSemanticSentenceAnchor) ?? rows[0] }
 }
 
 struct TranscriptView: View {
@@ -133,6 +140,19 @@ struct TranscriptView: View {
         }.padding(16)
     }
 
+    private var displayGroups: [CaptionDisplayGroup] {
+        var groups: [CaptionDisplayGroup] = []
+        for row in model.captions {
+            let id = row.semanticID
+            if let last = groups.indices.last, groups[last].id == id {
+                groups[last].rows.append(row)
+            } else {
+                groups.append(.init(id: id, rows: [row]))
+            }
+        }
+        return groups
+    }
+
     private func transcriptPane(original: Bool) -> some View {
         VStack(spacing: 0) {
             Text(original ? "원문" : "한국어 번역")
@@ -142,29 +162,32 @@ struct TranscriptView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(model.captions) { row in
+                        ForEach(displayGroups) { group in
                             VStack(spacing: 0) {
-                                Group {
-                                    if original { source(row) } else { translation(row) }
-                                }
-                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .topLeading)
-                                .padding(.leading, original ? 30 : 14).padding(.trailing, 14).padding(.vertical, 12)
-                                .overlay(alignment: .leading) {
-                                    if original {
-                                        Button {
-                                            if row.isFinal { selection = .init(row: row, token: nil) }
-                                        } label: {
-                                            RoundedRectangle(cornerRadius: 2)
-                                                .fill(gutterColor(row.gutterHint).opacity(row.gutterHint == .neutral ? 0.18 : 0.45))
-                                                .frame(width: 3).padding(.vertical, 6)
-                                                .frame(width: 30).frame(maxHeight: .infinity)
-                                                .contentShape(Rectangle())
-                                        }.buttonStyle(.plain).disabled(!row.isFinal)
-                                            .accessibilityLabel("확정 문장 고품질 번역")
+                                if original {
+                                    ForEach(group.rows) { row in
+                                        source(row)
+                                            .frame(maxWidth: .infinity, minHeight: 44, alignment: .topLeading)
+                                            .padding(.leading, 30).padding(.trailing, 14).padding(.vertical, 12)
+                                            .overlay(alignment: .leading) {
+                                                Button {
+                                                    if row.isFinal { selection = .init(row: row, token: nil) }
+                                                } label: {
+                                                    gutterMark(row.gutterHint)
+                                                        .frame(width: 3).padding(.vertical, 6)
+                                                        .frame(width: 30).frame(maxHeight: .infinity)
+                                                        .contentShape(Rectangle())
+                                                }.buttonStyle(.plain).disabled(!row.isFinal)
+                                                    .accessibilityLabel("확정 문장 고품질 번역")
+                                            }
                                     }
+                                } else {
+                                    translation(group.anchor)
+                                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .topLeading)
+                                        .padding(.leading, 14).padding(.trailing, 14).padding(.vertical, 12)
                                 }
                                 Divider().padding(.leading, original ? 30 : 14)
-                            }.id(row.id)
+                            }.id(group.id)
                         }
                         Color.clear.frame(height: 1).id("bottom")
                     }.scrollTargetLayout()
@@ -206,9 +229,20 @@ struct TranscriptView: View {
             selection = .init(row: row, token: $0)
         }
     }
+    @ViewBuilder
+    private func gutterMark(_ hint: SpeakerGutterHint) -> some View {
+        if hint == .mixed {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(LinearGradient(colors: [.teal.opacity(0.55), .orange.opacity(0.55)],
+                                     startPoint: .top, endPoint: .bottom))
+        } else {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(gutterColor(hint).opacity(hint == .neutral ? 0.18 : 0.45))
+        }
+    }
     private func gutterColor(_ hint: SpeakerGutterHint) -> Color {
         switch hint {
-        case .neutral: return .secondary
+        case .neutral, .mixed: return .secondary
         case .first: return .teal
         case .second: return .orange
         }

@@ -6,6 +6,101 @@ import CoreImage
 import ImageIO
 import UniformTypeIdentifiers
 
+// The picker may issue several selections while ScreenCaptureKit is suspending
+// in startCapture/stopCapture. @MainActor isolation alone does not serialize
+// those async operations: every await permits another selection to enter.
+// Keep every transition in one FIFO, including transitions superseded by a
+// later selection. A successor must never start before its predecessor ends.
+@MainActor
+final class CaptureSelectionQueue {
+    private var tail: Task<Void, Never>?
+
+    func enqueue(_ operation: @escaping @MainActor () async -> Void) {
+        let predecessor = tail
+        tail = Task { @MainActor in
+            await predecessor?.value
+            await operation()
+        }
+    }
+
+    func drain() async { await tail?.value }
+}
+
+// Two owners call SystemAudioInput.stop(): the user's Stop action and the
+// input loop's deferred cleanup. All callers must await the SAME native-stop
+// result, not let the second call see `stream == nil` and return early.
+@MainActor
+final class CaptureStopFlight {
+    private var task: Task<Void, Never>?
+    var hasStarted: Bool { task != nil }
+
+    func run(_ operation: @escaping @MainActor () async -> Void) async {
+        if let task { await task.value; return }
+        let created = Task { @MainActor in await operation() }
+        task = created
+        await created.value
+    }
+}
+
+// Keep track of native stream stops whose completion has not been confirmed.
+// In particular, a thrown stopCapture() may leave a running native stream.
+// This ledger is process-wide, not owned by an individual capture instance.
+@MainActor
+final class CaptureNativeStopLedger {
+    static let shared = CaptureNativeStopLedger()
+    // Retain the object, not only ObjectIdentifier: reusing a deallocated
+    // stream's identity must never accidentally clear a previous failure.
+    // A failed native stop requires an app restart unless a later retry
+    // explicitly confirms the old SCStream has stopped.
+    private var unconfirmed: [ObjectIdentifier: AnyObject] = [:]
+
+    var canStart: Bool { unconfirmed.isEmpty }
+    func beganStopping(_ stream: AnyObject) { unconfirmed[ObjectIdentifier(stream)] = stream }
+    func confirmedStopped(_ stream: AnyObject) { unconfirmed[ObjectIdentifier(stream)] = nil }
+}
+
+// Coalesce every stop of the same native stream (picker, user Stop,
+// screenshot failure). A successful stop is idempotent even if a second
+// caller arrives after completion. Failed stops remain retryable, but the
+// ledger prevents a new capture while the native state is unconfirmed.
+@MainActor
+final class CaptureNativeStopFlights {
+    private final class WeakReference {
+        weak var object: AnyObject?
+        init(_ object: AnyObject) { self.object = object }
+    }
+    private struct Flight {
+        let stream: AnyObject
+        let task: Task<Void, Error>
+    }
+    private var running: [ObjectIdentifier: Flight] = [:]
+    private var confirmed: [ObjectIdentifier: WeakReference] = [:]
+
+    func stop(_ stream: AnyObject, operation: @escaping @MainActor () async throws -> Void) async throws {
+        let id = ObjectIdentifier(stream)
+        confirmed = confirmed.filter { $0.value.object != nil }
+        if confirmed[id]?.object === stream { return }
+        if let flight = running[id], flight.stream === stream {
+            try await flight.task.value
+            return
+        }
+        let work = Task { @MainActor in
+            CaptureNativeStopLedger.shared.beganStopping(stream)
+            try await operation()
+            CaptureNativeStopLedger.shared.confirmedStopped(stream)
+        }
+        running[id] = Flight(stream: stream, task: work)
+        do {
+            try await work.value
+            confirmed[id] = WeakReference(stream)
+            running[id] = nil
+        } catch {
+            running[id] = nil
+            throw error
+        }
+    }
+}
+
 #if targetEnvironment(simulator)
 
 // ScreenCaptureKit is absent from the iOS 27 Simulator SDK. Keep the same
@@ -34,6 +129,12 @@ final class SystemAudioInput: NSObject, AudioInput {
 // Physical iOS 27+ implementation. This file is never included in the Playground target.
 @MainActor
 final class SystemAudioInput: NSObject, AudioInput {
+    private let nativeStopFlights = CaptureNativeStopFlights()
+
+    private func stopNativeCapture(_ source: SCStream) async throws {
+        try await nativeStopFlights.stop(source) { try await source.stopCapture() }
+    }
+
     private struct ScreenshotTarget {
         let width: Int
         let height: Int
@@ -43,75 +144,94 @@ final class SystemAudioInput: NSObject, AudioInput {
         var wasDownscaled: Bool { width < sourceWidth || height < sourceHeight }
     }
 
+    // Device Validation may probe screenshots without a caption. Saved study
+    // screenshots always use the source-time-qualified overload below.
     func captureLearningScreenshot() async throws -> [String: Any] {
+        try await captureLearningScreenshot(expectedSentence: nil)
+    }
+
+    func captureLearningScreenshot(matchingSentenceStart start: Double, end: Double) async throws -> [String: Any] {
+        try await captureLearningScreenshot(expectedSentence: (start: start, end: end))
+    }
+
+    private func captureLearningScreenshot(expectedSentence: (start: Double, end: Double)?) async throws -> [String: Any] {
         guard active, let stream, let target = screenshotTarget else {
             throw AppFailure.message("시스템 화면 캡처가 실행 중일 때만 스크린샷을 저장할 수 있습니다.")
         }
         guard screenshotOutput == nil else {
             throw AppFailure.message("이미 저장용 스크린샷을 캡처하고 있습니다.")
         }
+        // This comparison uses the first successfully delivered PCM from the
+        // CURRENT selected stream, not the picker request UUID. A new picker
+        // request has a different lifetime from its native audio source.
+        if let expectedSentence {
+            guard ScreenshotSourcePolicy.matches(sentenceStart: expectedSentence.start,
+                    sentenceEnd: expectedSentence.end,
+                    currentSourceFirstAudioTime: delegate?.firstAudioTime(for: stream)) else {
+                throw AppFailure.message("자막과 현재 공유 대상이 달라 스크린샷을 생략합니다.")
+            }
+        }
 
-        // Keep one long-running SCStream. Normal operation attaches only the audio
-        // output. When the user explicitly saves an item, temporarily attach one
-        // .screen output to this same stream, receive one frame, and remove it again.
-        // No picker re-presentation and no continuous screen-sample delivery while
-        // the screenshot output is detached.
         let requestID = selectionID
         let output = ScreenFrameOutput()
         let ticket = output.armScreenshot(minWidth: target.width, minHeight: target.height)
         screenshotOutput = output
-        var screenOutputAttached = false
-
+        var attached = false
         do {
             try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: output.queue)
-            screenOutputAttached = true
+            attached = true
             let image = try await ticket.value()
-
             guard active, selectionID == requestID,
                   self.stream === stream, self.screenshotOutput === output else {
                 throw AppFailure.message("화면 공유 대상이 바뀌어 스크린샷을 취소했습니다.")
             }
-
-            do {
-                try stream.removeStreamOutput(output, type: .screen)
-                screenOutputAttached = false
-            } catch {
-                // Never leave high-resolution screen delivery attached after a save.
-                // If removal itself fails, stop the capture rather than silently
-                // continuing to receive screen frames.
-                output.cancelScreenshot(ticket, error: error)
-                try? await stream.stopCapture()
-                if self.stream === stream {
-                    self.stream = nil
-                    self.contentFilter = nil
-                    self.screenshotTarget = nil
-                    self.screenshotOutput = nil
-                    continuation?.finish(throwing: error)
+            if let expectedSentence {
+                guard ScreenshotSourcePolicy.matches(sentenceStart: expectedSentence.start,
+                        sentenceEnd: expectedSentence.end,
+                        currentSourceFirstAudioTime: delegate?.firstAudioTime(for: stream)) else {
+                    throw AppFailure.message("화면 캡처 중 공유 대상이 달라졌습니다.")
                 }
-                throw error
             }
-
+            try stream.removeStreamOutput(output, type: .screen)
+            attached = false
             if self.screenshotOutput === output { self.screenshotOutput = nil }
             return try Self.encodeScreenshot(image, target: target)
         } catch {
-            output.cancelScreenshot(ticket, error: error)
-            if screenOutputAttached {
+            let originalError = error
+            output.cancelScreenshot(ticket, error: originalError)
+            if attached {
                 do {
+                    // Exactly one cleanup site: a failed removal can be retried
+                    // once here, without the old nested catch calling Stop twice.
                     try stream.removeStreamOutput(output, type: .screen)
+                    attached = false
                 } catch {
-                    // Same fail-closed rule as above: do not permit an orphaned
-                    // high-resolution screen output to remain attached.
-                    try? await stream.stopCapture()
+                    let detachError = error
+                    // A screenshot output may remain attached, so fail closed.
+                    // Concurrent user Stop joins this exact native operation.
+                    var nativeStopConfirmed = false
+                    do {
+                        try await stopNativeCapture(stream)
+                        nativeStopConfirmed = true
+                    } catch {
+                        // Keep `self.stream` for the later explicit Stop retry.
+                        // The process-wide ledger blocks any fresh capture.
+                    }
                     if self.stream === stream {
-                        self.stream = nil
+                        active = false
+                        selectionID = UUID()
+                        delegate?.deactivate()
+                        if let delegate { picker.remove(delegate) }
+                        picker.isActive = false
+                        if nativeStopConfirmed { self.stream = nil }
                         self.contentFilter = nil
                         self.screenshotTarget = nil
-                        continuation?.finish(throwing: error)
+                        continuation?.finish(throwing: detachError)
                     }
                 }
             }
             if self.screenshotOutput === output { self.screenshotOutput = nil }
-            throw error
+            throw originalError
         }
     }
 
@@ -207,9 +327,19 @@ final class SystemAudioInput: NSObject, AudioInput {
     private let picker = SCContentSharingPicker.shared
     private var active = false
     private var selectionID = UUID()
+    private let selectionQueue = CaptureSelectionQueue()
+    private let stopFlight = CaptureStopFlight()
     private(set) var progress: AudioInputProgress? = AudioInputProgress()
+    private(set) var stopFailure: String?
 
     func start() async throws -> AsyncThrowingStream<PCMChunk, Error> {
+        guard !stopFlight.hasStarted else {
+            throw AppFailure.message("이미 종료 절차를 시작한 입력 인스턴스입니다. 새 입력을 생성하세요.")
+        }
+        guard CaptureNativeStopLedger.shared.canStart else {
+            throw AppFailure.message("이전 시스템 캡처의 종료 여부가 확인되지 않았습니다. 앱을 완전히 종료한 뒤 다시 시작하세요.")
+        }
+        stopFailure = nil
         // An optional pass is shed well before this emergency bound. Never silently
         // drop live PCM or conceal unlimited latency/memory growth in an unbounded queue.
         let (sequence, continuation) = AsyncThrowingStream<PCMChunk, Error>.makeStream(bufferingPolicy: .bufferingOldest(512))
@@ -235,12 +365,58 @@ final class SystemAudioInput: NSObject, AudioInput {
         screenshotOutput = nil
         previousScreenshotOutput?.cancelPending(AppFailure.message("화면 공유 대상이 변경되었습니다."))
 
+        // Enqueue rather than running a second stop/start concurrently with an
+        // earlier picker callback. The request ID drops obsolete selections once
+        // their predecessors finish; it does NOT skip their in-flight teardown.
+        selectionQueue.enqueue { [weak self] in
+            await self?.installSelected(filter, requestID: requestID)
+        }
+    }
+
+    private func failSelection(_ underlying: Error) {
+        guard active else { return }
+        // Fail closed: a failed stop cannot establish that the old SCStream has
+        // ended, so do not start a replacement or accept any more picker events.
+        active = false
+        selectionID = UUID()
+        delegate?.deactivate()
+        screenshotOutput?.cancelPending(underlying)
+        screenshotOutput = nil
+        if let delegate { picker.remove(delegate) }
+        picker.isActive = false
+        continuation?.finish(throwing: AppFailure.message(
+            "이전 시스템 오디오 캡처 종료에 실패했습니다. 새 캡처를 시작하지 않았습니다: " + underlying.localizedDescription))
+        continuation = nil
+        // Retain the old stream for AppModel.run() -> stop() cleanup retry.
+    }
+
+    private func installSelected(_ filter: SCContentFilter, requestID: UUID) async {
+        guard active, selectionID == requestID else { return }
+        guard CaptureNativeStopLedger.shared.canStart else {
+            failSelection(AppFailure.message("다른 시스템 캡처의 종료가 확인되지 않았습니다."))
+            return
+        }
+
         let previous = stream
-        stream = nil
         contentFilter = nil
         screenshotTarget = nil
-        if let previous { try? await previous.stopCapture() }
+        if let previous {
+            delegate?.deactivate()
+            do {
+                try await stopNativeCapture(previous)
+            } catch {
+                failSelection(error)
+                return
+            }
+            // A concurrent user Stop may invalidate this selection while the
+            // old stream is stopping. It will wait for this handoff first.
+            if self.stream === previous { self.stream = nil }
+        }
         guard active, selectionID == requestID else { return }
+        guard CaptureNativeStopLedger.shared.canStart else {
+            failSelection(AppFailure.message("시스템 캡처 종료가 아직 확인되지 않았습니다."))
+            return
+        }
 
         let target = try? Self.screenshotTarget(for: filter, maxEdge: 1600)
         let config = Self.audioCaptureConfiguration(screenTarget: target)
@@ -250,19 +426,55 @@ final class SystemAudioInput: NSObject, AudioInput {
         self.contentFilter = filter
         self.screenshotTarget = target
         delegate.activate(stream)
+        var attemptedStart = false
         do {
             // Normal live operation is audio-only at the output boundary.
             // No .screen output is attached until an explicit save requests one frame.
             try stream.addStreamOutput(delegate, type: .audio, sampleHandlerQueue: delegate.queue)
+            attemptedStart = true
             try await stream.startCapture()
-            if !active || selectionID != requestID { try? await stream.stopCapture() }
+            if !active || selectionID != requestID {
+                // Superseded startCapture may finish after a newer picker request
+                // (or Stop). Never silently abandon its live native stream.
+                do {
+                    try await stopNativeCapture(stream)
+                    if self.stream === stream {
+                        self.stream = nil
+                        self.contentFilter = nil
+                        self.screenshotTarget = nil
+                    }
+                } catch {
+                    // Preserve the stream for the explicit Stop retry. When a
+                    // newer selection exists, fail closed instead of letting it
+                    // start while this stream's state is unknown.
+                    failSelection(error)
+                }
+            }
         } catch {
-            if self.stream === stream {
+            let startError = error
+            // addStreamOutput may throw before we ever attempt to start. Once
+            // startCapture was invoked, however, never assume a thrown start
+            // proves that native resources were torn down. Confirm a stop or
+            // preserve the stream in the unconfirmed-stop ledger.
+            if attemptedStart {
+                do {
+                    try await stopNativeCapture(stream)
+                    if self.stream === stream {
+                        self.stream = nil
+                        self.contentFilter = nil
+                        self.screenshotTarget = nil
+                    }
+                } catch {
+                    if active && selectionID == requestID { failSelection(error) }
+                    // Preserve the stream for explicit Stop retry.
+                    return
+                }
+            } else if self.stream === stream {
                 self.stream = nil
                 self.contentFilter = nil
                 self.screenshotTarget = nil
             }
-            if active && selectionID == requestID { continuation?.finish(throwing: error) }
+            if active && selectionID == requestID { continuation?.finish(throwing: startError) }
         }
     }
 
@@ -277,21 +489,43 @@ final class SystemAudioInput: NSObject, AudioInput {
     }
 
     func stop() async {
+        await stopFlight.run { [self] in await stopOnce() }
+    }
+
+    private func stopOnce() async {
         active = false; selectionID = UUID()
 
         let previousScreenshotOutput = screenshotOutput
         screenshotOutput = nil
         previousScreenshotOutput?.cancelPending(CancellationError())
 
+        // Stop accepting PCM and unblock the input consumer *before* waiting
+        // for an in-flight native selection transition. A native SDK call may
+        // take an arbitrarily long time to respond.
+        delegate?.deactivate()
+        continuation?.finish(); continuation = nil
+
+        // Finish any pending picker transition before examining `stream`.
+        // Otherwise Stop can miss the old stream while a selection is awaiting
+        // its stopCapture(), and incorrectly report a completed teardown.
+        await selectionQueue.drain()
         let previous = stream
         stream = nil
         contentFilter = nil
         screenshotTarget = nil
-        continuation?.finish(); continuation = nil
         if let delegate { picker.remove(delegate) }
         picker.isActive = false
         delegate = nil
-        if let previous { try? await previous.stopCapture() }
+        if let previous {
+            do {
+                try await stopNativeCapture(previous)
+            } catch {
+                // The ledger deliberately keeps the unconfirmed SCStream. Do not
+                // disguise a failed native teardown as the normal stopped state.
+                stopFailure = "시스템 오디오 캡처 종료를 확인하지 못했습니다. 앱을 완전히 종료한 뒤 다시 시작하세요: "
+                    + error.localizedDescription
+            }
+        }
     }
 }
 
@@ -398,6 +632,9 @@ private final class CaptureDelegate: NSObject, SCContentSharingPickerObserver, S
     private var origin: Double?
     private var clock = AudioSourceClock()
     private var streamID: ObjectIdentifier?
+    // Written on the PCM callback queue; snapshot through queue.sync. The
+    // capture-wide PTS origin is retained across stream selections.
+    private var currentStreamFirstAudioTime: Double?
     private var failed = false
     init(owner: SystemAudioInput, continuation: AsyncThrowingStream<PCMChunk, Error>.Continuation, progress: AudioInputProgress) {
         self.owner = owner; self.continuation = continuation; self.progress = progress
@@ -405,7 +642,22 @@ private final class CaptureDelegate: NSObject, SCContentSharingPickerObserver, S
     func activate(_ stream: SCStream) {
         // All SCStream callbacks use the capture clock. A new selected stream
         // must retain the original PTS origin, including the gap during selection.
-        queue.sync { self.streamID = ObjectIdentifier(stream) }
+        queue.sync {
+            self.streamID = ObjectIdentifier(stream)
+            self.currentStreamFirstAudioTime = nil
+        }
+    }
+    func deactivate() {
+        queue.sync {
+            self.streamID = nil
+            self.currentStreamFirstAudioTime = nil
+        }
+    }
+    func firstAudioTime(for stream: SCStream) -> Double? {
+        queue.sync {
+            guard self.streamID == ObjectIdentifier(stream) else { return nil }
+            return currentStreamFirstAudioTime
+        }
     }
     func contentSharingPicker(_ picker: SCContentSharingPicker, didUpdateWith filter: SCContentFilter, for stream: SCStream?) {
         Task { @MainActor in await owner?.selected(filter) }
@@ -446,7 +698,9 @@ private final class CaptureDelegate: NSObject, SCContentSharingPickerObserver, S
         }
         switch continuation.yield(chunk) {
         case .terminated: return
-        case .enqueued: break
+        case .enqueued:
+            // Mark a source as available only after its PCM was enqueued.
+            if currentStreamFirstAudioTime == nil { currentStreamFirstAudioTime = time }
         case .dropped:
             failed = true
             continuation.finish(throwing: AppFailure.message("시스템 오디오 대기열 한도를 초과해 입력을 중지했습니다."))

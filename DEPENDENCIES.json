@@ -6,7 +6,21 @@
     "phase1": "Removed after user-reported Playgrounds archive validation failure: could not find executable for 'unzip'",
     "requiredBinaryTarget": "NemoTextProcessing",
     "binaryURL": "https://github.com/FluidInference/text-processing-rs/releases/download/v0.3.0/NemoTextProcessing.xcframework.zip",
-    "manifest": "https://github.com/FluidInference/FluidAudio/blob/5c19d5e12320e22bbfb7a1877b089d2665a69add/Package.swift"
+    "manifest": "https://github.com/FluidInference/FluidAudio/blob/5c19d5e12320e22bbfb7a1877b089d2665a69add/Package.swift",
+    "liveDiarizationWiring": "stage8.9B-B: dedicated Primary realtime path uses one authoritative bundled LS-EEND dihard3/100ms model; no runtime network fallback; raw slot probabilities temporally stabilized"
+  },
+  "liveDiarizerModel": {
+    "source": "FluidInference/ls-eend-coreml",
+    "revision": "62e09c20262f7c7406c7a5e70755e9f957ef09ac",
+    "sourcePath": "optimized/dih3/100ms/ls_eend_dih3_100ms.mlmodelc",
+    "fluidAudioRevision": "5c19d5e12320e22bbfb7a1877b089d2665a69add",
+    "variant": "dihard3",
+    "step": "100ms",
+    "license": "MIT",
+    "runtimePolicy": "bundled-offline-only",
+    "preparation": "Tools/prepare-diarizer-macos.sh",
+    "assetVerification": "Tools/diarizer_assets.py",
+    "phase2Gate": "Phase 2 hard-fails before Xcode or PASS if model/provenance is absent; app bundle reverified after device Release build"
   },
   "DeepFilterNet": {
     "revision": "c6c4b9dc98c62bfa90ed66c5fd4f5d54e88c7b4f",
@@ -27,7 +41,7 @@
   },
   "Sudachi": {
     "revision": "90fd6068c80c2fc3b63e0dbab0e341475bad4d8f",
-    "status": "A/B/C source and Phase 2 build wiring present; Apple CI Phase 1 PASS; Phase 2 0.6 resource family installs, license-evidence staging rerun pending",
+    "status": "A/B/C native integration validated in stage8.7 Phase 2: real dictionary Rust tests, simulator XCTest, and unsigned device build PASS",
     "resourcePackages": {
       "SudachiPy": "0.6.11",
       "SudachiDict-full": "20260723"
@@ -36,12 +50,13 @@
     "resourceBuilder": "Tools/build-sudachi-macos.sh"
   },
   "separator": {
-    "status": "Source pinned and preparation/asset verification implemented; model conversion, Japanese quality, Apple build and iPad runtime NOT RUN",
+    "status": "REQUIRED for Phase 2. stage8.8 CI prepares/verifies pinned SepFormer assets before build and refuses PASS when absent; conversion/Apple build/Japanese iPad quality rerun pending",
     "source": "speechbrain/sepformer-whamr16k",
     "revision": "21a5b500c6f52fddc387c5d9e5fb13ffd6f039c5",
     "license": "Apache-2.0 (model card declaration)",
     "preparation": "Tools/prepare-separator-macos.sh",
-    "assetVerification": "Tools/separator_assets.py"
+    "assetVerification": "Tools/separator_assets.py",
+    "phase2Gate": "Tools/prepare-separator-macos.sh -> Tools/test-apple.sh 2; model-free Phase 2 PASS is no longer allowed"
   },
   "Phase1": {
     "externalSwiftPackages": [],
@@ -66,5 +81,19 @@
     "policy": "Keep the actual resolved graph; disable automatic package resolution when the lockfile exists. User-authorized package-plugin validation skip is Phase 2 only. No macro-validation skip.",
     "sourceRun": "https://github.com/Mngu39/JP_Live/actions/runs/34706198247",
     "sha256": "2b362b5aac09270fcf129ea0fcd4ee75430e6caa21c01368fbb03a42c75a4aa7"
+  },
+  "separatorVADModel": {
+    "source": "FluidInference/silero-vad-coreml",
+    "revision": "b419383c55c110e2c9271fa6ee0ea83d03c70d96",
+    "sourcePath": "silero-vad-unified-256ms-v6.2.1.mlmodelc",
+    "fluidAudioRevision": "5c19d5e12320e22bbfb7a1877b089d2665a69add",
+    "variant": "silero-vad-unified-256ms-v6.2.1",
+    "sampleRate": 16000,
+    "chunkSize": 4096,
+    "license": "MIT",
+    "runtimePolicy": "bundled-offline-only",
+    "preparation": "Tools/prepare-vad-macos.sh",
+    "assetVerification": "Tools/vad_assets.py",
+    "phase2Gate": "Phase 2 hard-fails before Xcode/PASS if bundled VAD provenance is absent; app bundle reverified after device Release build"
   }
 }

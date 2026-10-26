@@ -11,8 +11,10 @@ struct StudyPopup: View {
     @EnvironmentObject private var app: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var token: WordToken?
+    @State private var sentenceView: Bool
     @State private var baseTokens: [WordToken]
     @State private var analyzedMode: SudachiSplitMode?
+    @State private var analyzedSource = ""
     @State private var morphologyGeneration = UUID()
     @State private var lemmaReading = ""
     @State private var lemmaReadingKey = ""
@@ -30,14 +32,25 @@ struct StudyPopup: View {
     init(selection: PopupSelection) {
         self.selection = selection
         _token = State(initialValue: selection.token)
+        _sentenceView = State(initialValue: selection.sentenceMode)
         _baseTokens = State(initialValue: selection.row.tokens)
     }
-    private var row: Caption { selection.row }
+    private var liveRow: Caption? {
+        app.popupCaption(rowID: selection.row.id, captureID: selection.row.captureID,
+                         expectedSource: selection.row.source, sentenceMode: sentenceView)
+    }
+    private var row: Caption { liveRow ?? selection.row }
+    private var selectionCurrent: Bool { liveRow != nil }
     private var tokens: [WordToken] { useAI ? reconstruction?.units ?? baseTokens : baseTokens }
     private var translation: String { useAI ? reconstruction?.translation ?? baseTranslation : baseTranslation }
     private var popupMode: SudachiSplitMode { row.language == .japanese ? app.splitMode : .c }
-    private var tokensReady: Bool { analyzedMode == popupMode && !baseTokens.isEmpty }
-    private var selectedKey: String { "\(token?.id ?? "sentence"):\(useAI):\(popupMode.rawValue):\(morphologyGeneration)" }
+    private var tokensReady: Bool { analyzedMode == popupMode && analyzedSource == row.source && !baseTokens.isEmpty }
+    // Caption.revision also changes for late speaker/translation metadata. A word's
+    // UTF-16 selection remains valid while its owning visual source is unchanged.
+    private var popupContextKey: String { PopupAnalysisIdentity.morphologyKey(mode: popupMode.rawValue, row: row) }
+    // English contextual meaning must refresh if the logical sentence changes even
+    // when the selected visual fragment and its token offsets stay unchanged.
+    private var selectedKey: String { PopupAnalysisIdentity.meaningKey(mode: popupMode.rawValue, row: row, tokenID: token?.id, useAI: useAI, generation: morphologyGeneration) }
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -71,6 +84,10 @@ struct StudyPopup: View {
                         Divider()
                         Text(translation.isEmpty ? (error.isEmpty ? "DeepL 번역 중…" : "번역을 불러오지 못했습니다.") : translation).font(.title3)
                     }
+                    if !selectionCurrent {
+                        Text("자막이 분리·갱신되어 이 선택은 더 이상 현재 원문과 일치하지 않습니다. 다시 선택해 주세요.")
+                            .foregroundStyle(.orange).font(.callout)
+                    }
                     if !error.isEmpty { Text(error).foregroundStyle(.red).font(.callout) }
                     if !saveStatus.isEmpty { Text(saveStatus).foregroundStyle(.secondary).font(.callout) }
                     if row.language == .japanese {
@@ -79,8 +96,8 @@ struct StudyPopup: View {
                             Button("최근 세션에 저장", systemImage: "square.and.arrow.down") {
                                 if let session = app.selectedSession() { Task { await save(session) } }
                                 else { choosingSession = true }
-                            }.buttonStyle(.borderedProminent).disabled(busy || !tokensReady)
-                            Button("세션 선택", systemImage: "plus") { choosingSession = true }.buttonStyle(.bordered).disabled(busy || !tokensReady)
+                            }.buttonStyle(.borderedProminent).disabled(busy || !tokensReady || !selectionCurrent)
+                            Button("세션 선택", systemImage: "plus") { choosingSession = true }.buttonStyle(.bordered).disabled(busy || !tokensReady || !selectionCurrent)
                         }
                     }
                 }.padding(22)
@@ -89,7 +106,9 @@ struct StudyPopup: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    if token != nil { Button("문장", systemImage: "chevron.left") { token = nil; error = ""; saveStatus = "" } }
+                    if token != nil { Button("문장", systemImage: "chevron.left") {
+                        sentenceView = true; token = nil; error = ""; saveStatus = ""
+                    } }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     if row.language == .japanese {
@@ -112,16 +131,20 @@ struct StudyPopup: View {
             .sheet(item: $dictionaryDestination) { destination in
                 DictionaryScreen(term: destination.term, url: destination.url)
             }
-            .task(id: popupMode) {
+            .task(id: popupContextKey) {
                 let mode = popupMode
+                let source = row.source
                 let selected = analyzedMode == nil ? token : nil
                 morphologyGeneration = UUID()
+                analyzedMode = nil; analyzedSource = ""
                 baseTokens = []; token = selected; useAI = false; reconstruction = nil
+                baseTranslation = ""; meaning = ""; saveStatus = ""
                 lemmaReading = ""; lemmaReadingKey = ""
+                guard selectionCurrent else { return }
                 do {
-                    let value = try await app.analyzeWords(row.source, language: row.language)
-                    if !Task.isCancelled && mode == popupMode {
-                        baseTokens = value; analyzedMode = mode
+                    let value = try await app.analyzeWords(source, language: row.language)
+                    if !Task.isCancelled && mode == popupMode && source == row.source && selectionCurrent {
+                        baseTokens = value; analyzedMode = mode; analyzedSource = source
                         if let selected {
                             token = value.first { $0.start == selected.start && $0.end == selected.end && $0.surface == selected.surface }
                         }
@@ -150,7 +173,7 @@ struct StudyPopup: View {
                 if useAI, let value = selected.meaning, !value.isEmpty { meaning = value; return }
                 do {
                     let value = try await WorkerClient.shared.translate(selected.lemma, language: row.language,
-                        context: row.language == .english ? row.source : nil)
+                        context: row.language == .english ? row.semanticSource : nil)
                     if !Task.isCancelled { meaning = value }
                 } catch { if !Task.isCancelled { self.error = error.localizedDescription } }
             }
@@ -206,33 +229,59 @@ struct StudyPopup: View {
     private func toggleAI() async {
         guard tokensReady else { return }
         let generation = morphologyGeneration
+        let contextKey = popupContextKey
+        let sourceRow = row
+        let sourceTokens = baseTokens
         error = ""
         if reconstruction == nil {
             aiBusy = true; defer { aiBusy = false }
             do {
-                if baseTranslation.isEmpty { baseTranslation = try await WorkerClient.shared.translate(row.source, language: row.language) }
-                let value = try await WorkerClient.shared.reconstruct(row, translation: baseTranslation, tokens: baseTokens)
-                guard generation == morphologyGeneration, tokensReady else { return }
+                if baseTranslation.isEmpty {
+                    let translated = try await WorkerClient.shared.translate(sourceRow.source, language: sourceRow.language)
+                    guard generation == morphologyGeneration, contextKey == popupContextKey,
+                          selectionCurrent, tokensReady else { return }
+                    baseTranslation = translated
+                }
+                let value = try await WorkerClient.shared.reconstruct(sourceRow, translation: baseTranslation, tokens: sourceTokens)
+                guard generation == morphologyGeneration, contextKey == popupContextKey,
+                      selectionCurrent, tokensReady else { return }
                 reconstruction = value
             }
-            catch { self.error = error.localizedDescription; return }
+            catch {
+                guard generation == morphologyGeneration, contextKey == popupContextKey,
+                      selectionCurrent else { return }
+                self.error = error.localizedDescription; return
+            }
         }
         let old = token
         useAI.toggle()
         if let old { token = tokens.first { $0.start < old.end && $0.end > old.start } }
     }
     private func save(_ session: LearningSession) async {
-        guard !busy, tokensReady else { return }
+        guard !busy, tokensReady,
+              let current = app.popupCaption(rowID: selection.row.id, captureID: selection.row.captureID,
+                                             expectedSource: selection.row.source, sentenceMode: sentenceView)
+        else { error = "자막이 갱신되어 저장할 수 없습니다. 다시 선택해 주세요."; return }
         busy = true; error = ""; saveStatus = ""; defer { busy = false }
+        let sourceSnapshot = current.source
         let savedToken = token, savedTokens = tokens
         var savedTranslation = translation
-        let screenshot = await app.learningScreenshot()
+        let screenshot = await app.learningScreenshot(for: current)
         do {
             if savedTranslation.isEmpty {
-                savedTranslation = try await WorkerClient.shared.translate(row.source, language: row.language)
+                savedTranslation = try await WorkerClient.shared.translate(sourceSnapshot, language: current.language)
+            }
+            guard let latest = app.popupCaption(rowID: selection.row.id, captureID: selection.row.captureID,
+                                                expectedSource: selection.row.source, sentenceMode: sentenceView),
+                  latest.source == sourceSnapshot, latest.semanticID == current.semanticID else {
+                throw AppFailure.message("저장 중 자막이 갱신되었습니다. 다시 선택해 주세요.")
+            }
+            // This request may finish after the popup switched from a visual word
+            // fragment to its full sentence. Do not overwrite the new view's translation.
+            if popupContextKey == PopupAnalysisIdentity.morphologyKey(mode: popupMode.rawValue, row: current) {
                 baseTranslation = savedTranslation
             }
-            let payload = try SavePayload.make(caption: row, session: session, token: savedToken, tokens: savedTokens,
+            let payload = try SavePayload.make(caption: latest, session: session, token: savedToken, tokens: savedTokens,
                 translation: savedTranslation, screenshot: screenshot)
             try await WorkerClient.shared.save(payload)
             app.selectSession(session)

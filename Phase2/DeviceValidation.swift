@@ -141,11 +141,17 @@ struct DeviceValidationSessionReport: Codable, Identifiable, Sendable {
     var speechAppendFrames: Int64
     var speechResults: Int
     var finalSpeechResults: Int
+    var semanticSpeechResults: Int
+    var invalidTimedSpeechResults: Int
     var captureRequestToFirstAudio: Double?
     var firstAudioToFirstSpeechResult: Double?
     var maxInputRMSDB: Double
     var maxInputPeakDB: Double
     var screenshotContinuity: DeviceValidationScreenshotContinuity
+    var speechTrace: [SpeechResultTrace]
+    var diarization: DiarizationDiagnostics
+    var separatorModelBundled: Bool
+    var diarizerModelBundled: Bool
 
     var pipelineWarnings: [String]
     var errors: [String]
@@ -172,19 +178,24 @@ struct DeviceValidationReport: Codable, Sendable {
         } else {
             let pair = Array(sessions.suffix(2))
             let startTolerance = 2.1 / 48000
+            let explicitRestart = DeviceValidationInvariants.explicitStopRestart(
+                firstStopped: pair[0].userStopped, secondStopped: pair[1].userStopped,
+                firstEnd: pair[0].endedAt, secondStart: pair[1].startedAt)
             let clean = pair.allSatisfy {
                 $0.rawChunks > 0 && $0.processedChunks > 0 && $0.analyzerChunks > 0 &&
-                $0.errors.isEmpty && $0.verdict != .fail
+                $0.sttPrepared && $0.speechAppendFrames > 0 && $0.semanticSpeechResults > 0 &&
+                $0.invalidTimedSpeechResults == 0 && $0.errors.isEmpty && $0.verdict != .fail
             }
             let reset = pair.allSatisfy {
                 abs($0.rawFirstTime ?? .infinity) <= startTolerance &&
                 abs($0.processedFirstTime ?? .infinity) <= startTolerance &&
                 abs($0.analyzerFirstTime ?? .infinity) <= max(startTolerance, Self.analyzerTimeTolerance($0))
             }
-            restart = .init(name: "stop_restart", verdict: clean && reset ? .pass : .fail,
-                detail: clean && reset
-                    ? "연속 두 세션이 실제 PCM/STT 입력을 수신했고 각 세션 시간축이 0에서 새로 시작했습니다."
-                    : "최근 두 세션 중 PCM/STT 입력, 종료 상태 또는 시간축 초기화가 올바르지 않습니다.")
+            let passed = explicitRestart && clean && reset
+            restart = .init(name: "stop_restart", verdict: passed ? .pass : .fail,
+                detail: passed
+                    ? "두 세션 모두 사용자가 Stop했고, 시간순으로 새 캡처를 시작했으며 각 PCM 시간축이 0에서 재설정됐습니다."
+                    : "수동 Stop 기록·세션 순서·PCM/STT 입력 상태·시간축 초기화 중 하나가 미충족입니다. 수동 Stop 후 재시작하세요.")
         }
 
         let overall: DeviceValidationVerdict
@@ -194,7 +205,7 @@ struct DeviceValidationReport: Codable, Sendable {
         else { overall = .pass }
 
         return DeviceValidationReport(
-            schemaVersion: 5,
+            schemaVersion: 10,
             createdAt: Date(),
             appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
                 ?? Bundle.main.infoDictionary?["CFBundleVersion"] as? String
@@ -210,6 +221,41 @@ struct DeviceValidationReport: Codable, Sendable {
     private static func analyzerTimeTolerance(_ report: DeviceValidationSessionReport) -> Double {
         let rates = report.analyzerFormats.map(\.sampleRate).filter { $0 > 0 }
         return rates.min().map { 2.1 / $0 } ?? 2.1 / 48000
+    }
+}
+
+enum ProductionOrchestrationContract {
+    static func run() -> (Bool, String) {
+        let capture = UUID()
+        var original = Caption(captureID: capture, language: .japanese, source: "前重後。", start: 0, end: 4, isFinal: true)
+        original.timedTextSpans = [
+            .init(utf16Start: 0, utf16End: 1, start: 0, end: 1),
+            .init(utf16Start: 1, utf16End: 2, start: 1, end: 2),
+            .init(utf16Start: 2, utf16End: 4, start: 2, end: 4)
+        ]
+        let episode = OverlapEpisode(start: 1, end: 2)
+        guard let target = LiveSeparationPass.target(for: original, episode: episode) else {
+            return (false, "production target mapping rejected deterministic timed Primary row")
+        }
+        var a = Caption(captureID: capture, language: .japanese, source: "甲", start: 1.00, end: 1.70, isFinal: true)
+        a.separationLane = 0
+        a.timedTextSpans = [.init(utf16Start: 0, utf16End: 1, start: 1.00, end: 1.70)]
+        var b = Caption(captureID: capture, language: .japanese, source: "乙", start: 1.20, end: 2.00, isFinal: true)
+        b.separationLane = 1
+        b.timedTextSpans = [.init(utf16Start: 0, utf16End: 1, start: 1.20, end: 2.00)]
+        let frames = [
+            [StemSpeechFrame(start: 1.00, end: 1.70, probability: 0.95)],
+            [StemSpeechFrame(start: 1.20, end: 2.00, probability: 0.95)]
+        ]
+        do {
+            let accepted = try SeparationAcceptance.accepted(.init(rows: [a,b], speechFrames: frames), target: target)
+            var buffer = TranscriptBuffer(); buffer.begin(captureID: capture, language: .japanese); buffer.rows = [original]
+            let ids = buffer.applySeparation(original: original, target: episode, separated: accepted)
+            guard !ids.isEmpty, buffer.rows.count >= 3 else { return (false, "production applySeparation rejected accepted separator rows") }
+            let groups = Set(buffer.rows.compactMap(\.semanticSentenceID))
+            guard groups.count == 1 else { return (false, "semantic sentence identity was not preserved through production replacement") }
+            return (true, "actual target → acceptance → TranscriptBuffer.applySeparation contract passed")
+        } catch { return (false, error.localizedDescription) }
     }
 }
 
@@ -308,6 +354,7 @@ final class DeviceValidationMetricStore {
     private let startedAt: Date
     private let startedUptime: Double
     private let requireScreenshotProbe: Bool
+    private let requireTwoSpeakerProbe: Bool
     private var captureRequestedUptime: Double?
     private var screenshotProbe: ScreenshotProbeState?
 
@@ -332,22 +379,40 @@ final class DeviceValidationMetricStore {
     private var sttPrepared = false
     private var speechAppendChunks = 0
     private var speechAppendFrames: Int64 = 0
-    private var speechResults = 0
-    private var finalSpeechResults = 0
+    private var speechAudit = DeviceValidationSpeechAudit()
+    private var speechResults: Int { speechAudit.callbackCount }
+    private var finalSpeechResults: Int { speechAudit.finalCount }
+    private var semanticSpeechResults: Int { speechAudit.recognizedCount }
+    private var invalidTimedSpeechResults: Int { speechAudit.invalidTimedCount }
+    private var invalidTimedExamples: [String] { speechAudit.invalidExamples }
     private var firstAudioUptime: Double?
     private var firstSpeechResultUptime: Double?
     private var maxInputRMSDB = -120.0
     private var maxInputPeakDB = -120.0
+    private var speechTrace: [SpeechResultTrace] = []
+    private var diarization = DiarizationDiagnostics(status: "화자 분석 준비 중")
+    private var diarizationFirstStart: Double?
+    private var diarizationLastEnd: Double?
+    private var diarizationMaxGap: Double = 0
+    private var stableSingleSpeakerSeconds: [String: Double] = [:]
+    private var overlapProbeStart: Double?
+    private var overlapProbeEnd: Double?
+    private var overlapFramesInsideProbe = 0
+    private var separatorModelBundled = false
+    private var diarizerModelBundled = false
 
     private var pipelineWarnings = Set<String>()
     private var errors = [String]()
 
     init(startedAt: Date = Date(), startedUptime: Double = ProcessInfo.processInfo.systemUptime,
-         requireScreenshotProbe: Bool = false) {
+         requireScreenshotProbe: Bool = false, requireTwoSpeakerProbe: Bool = false) {
         self.startedAt = startedAt
         self.startedUptime = startedUptime
         self.requireScreenshotProbe = requireScreenshotProbe
+        self.requireTwoSpeakerProbe = requireTwoSpeakerProbe
     }
+
+    var currentSourceTime: Double? { rawTimeline.lastEnd }
 
     func markSTTPrepared() { sttPrepared = true }
     func markCaptureRequested(observedAt: Double = ProcessInfo.processInfo.systemUptime) {
@@ -480,11 +545,79 @@ final class DeviceValidationMetricStore {
         speechAppendFrames += Int64(frames)
     }
 
-    func recordSpeechResult(final: Bool, observedAt: Double = ProcessInfo.processInfo.systemUptime) {
-        if firstSpeechResultUptime == nil { firstSpeechResultUptime = observedAt }
-        speechResults += 1
-        if final { finalSpeechResults += 1 }
+    func recordSpeechResult(text: String, final: Bool, start: Double, end: Double, finalizedThrough: Double?,
+                            timedSpans: [TimedTextSpan] = [],
+                            observedAt: Double = ProcessInfo.processInfo.systemUptime) {
+        speechAudit.record(text: text, final: final, timedSpans: timedSpans)
+        if firstSpeechResultUptime == nil && DeviceValidationInvariants.hasRecognizedContent(text) {
+            firstSpeechResultUptime = observedAt
+        }
+        speechTrace.append(.init(text: text, final: final, start: start, end: end,
+                                 finalizedThrough: finalizedThrough, timedSpans: timedSpans))
+        if speechTrace.count > 48 { speechTrace.removeFirst(speechTrace.count-48) }
     }
+
+    // Deterministic metric-store tests that do not model recognizer text keep the
+    // legacy counter-only seam. Production validation uses the full trace overload.
+    func recordSpeechResult(final: Bool, observedAt: Double = ProcessInfo.processInfo.systemUptime) {
+        recordSpeechResult(text: "", final: final, start: 0, end: 0, finalizedThrough: nil, observedAt: observedAt)
+    }
+
+    func markOverlapProbe(start: Double) {
+        guard start.isFinite, start >= 0 else { return }
+        overlapProbeStart = start; overlapProbeEnd = nil; overlapFramesInsideProbe = 0
+    }
+    func endOverlapProbe(end: Double) {
+        guard end.isFinite, let start = overlapProbeStart, end > start else { return }
+        overlapProbeEnd = end
+    }
+
+    func recordDiarizationStatus(_ value: String) { diarization.status = value }
+
+    func recordDiarization(_ decisions: [SpeechDecision]) {
+        let valid = decisions.filter(\.isValid).sorted { $0.start < $1.start }
+        guard !valid.isEmpty else { return }
+        diarization.status = "화자 분석 동작 중"
+        diarization.analysisActivatedAt = diarization.analysisActivatedAt ?? valid.first?.start
+        diarization.updateCount += valid.count
+        for frame in valid {
+            if diarizationFirstStart == nil { diarizationFirstStart = frame.start }
+            if let last = diarizationLastEnd, frame.start > last { diarizationMaxGap = max(diarizationMaxGap, frame.start-last) }
+            diarizationLastEnd = max(diarizationLastEnd ?? frame.end, frame.end)
+            if frame.speechProbability >= 0.60, frame.activeSpeakers == 1, let slot = frame.speakerSlot {
+                diarization.singleSpeakerFrames += 1
+                let key = "\(frame.identityEpoch):\(slot)"
+                stableSingleSpeakerSeconds[key, default: 0] += frame.end-frame.start
+            }
+            if frame.speechProbability >= 0.60, frame.activeSpeakers >= 2 {
+                diarization.overlapFrames += 1
+                if let a = overlapProbeStart {
+                    if let b = overlapProbeEnd {
+                        if frame.end > a, frame.start < b { overlapFramesInsideProbe += 1 }
+                    } else if frame.end > a {
+                        // While the user is actively holding the probe open, every newly
+                        // observed overlap frame is inside the expected window by definition.
+                        overlapFramesInsideProbe += 1
+                    }
+                }
+            }
+        }
+        var slots = Set(diarization.distinctSpeakerSlots)
+        slots.formUnion(valid.compactMap {
+            $0.speechProbability >= 0.60 && $0.activeSpeakers == 1 ? $0.speakerSlot : nil
+        })
+        diarization.distinctSpeakerSlots = slots.sorted()
+        diarization.latestEnd = max(diarization.latestEnd ?? 0, valid.map(\.end).max() ?? 0)
+        diarization.recentFrames += valid.map {
+            DiarizationFrameTrace(speechProbability: $0.speechProbability, activeSpeakers: $0.activeSpeakers,
+                                  start: $0.start, end: $0.end, speakerSlot: $0.speakerSlot,
+                                  identityEpoch: $0.identityEpoch)
+        }
+        if diarization.recentFrames.count > 192 { diarization.recentFrames.removeFirst(diarization.recentFrames.count-192) }
+    }
+
+    func recordSeparatorModelBundled(_ value: Bool) { separatorModelBundled = value }
+    func recordDiarizerModelBundled(_ value: Bool) { diarizerModelBundled = value }
 
     func recordPipelineMetrics(_ value: AudioMetrics) {
         if value.rmsDB.isFinite { maxInputRMSDB = max(maxInputRMSDB, value.rmsDB) }
@@ -495,6 +628,13 @@ final class DeviceValidationMetricStore {
     func recordError(_ value: String) {
         guard !value.isEmpty, !errors.contains(value) else { return }
         errors.append(value)
+    }
+
+    // Native stop errors are stored on AudioInput rather than thrown from stop().
+    // Capture them before finish() so runtime_errors cannot report a false PASS.
+    func recordNativeStopFailure(_ failure: String?) {
+        guard let failure, !failure.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        recordError("네이티브 종료 확인 실패: " + failure)
     }
 
     private func screenshotContinuityReport() -> DeviceValidationScreenshotContinuity {
@@ -651,9 +791,54 @@ final class DeviceValidationMetricStore {
             detail: "max RMS \(String(format: "%.1f", maxInputRMSDB)) dBFS · max peak \(String(format: "%.1f", maxInputPeakDB)) dBFS"))
 
         checks.append(.init(name: "speech_results",
-            verdict: speechResults > 0 ? .pass : .warning,
-            detail: speechResults > 0 ? "result \(speechResults)회 · final \(finalSpeechResults)회"
-                                      : "STT 입력은 전달됐지만 결과 텍스트가 없습니다. 실제 음성을 재생했는지 확인하세요."))
+            verdict: semanticSpeechResults > 0 ? .pass : .warning,
+            detail: semanticSpeechResults > 0
+                ? "의미 있는 STT 원문 \(semanticSpeechResults)회 / 전체 callback \(speechResults)회 · final \(finalSpeechResults)회"
+                : "STT callback \(speechResults)회 중 실제 인식된 텍스트가 없습니다. 실제 음성을 재생했는지 확인하세요."))
+
+        // Whole-session counters are monotone. Only the exported raw transcript
+        // remains a rolling 48-callback sample; discarded callbacks cannot erase FAIL.
+        let timedIntegrity = speechAudit.timedIntegrityPassed
+        let timedVerdict: DeviceValidationVerdict = semanticSpeechResults == 0 ? .warning : (timedIntegrity ? .pass : .fail)
+        checks.append(.init(name: "speech_timed_span_integrity",
+            verdict: timedVerdict,
+            detail: "전체 semantic callback \(semanticSpeechResults)개 중 무효 \(invalidTimedSpeechResults)개. " +
+                (timedIntegrity ? "UTF-16 coverage와 text/audio 시간 순서 통과."
+                 : (semanticSpeechResults == 0 ? "텍스트가 없어 검증 불가."
+                    : "무효 timed span 발견. " + invalidTimedExamples.joined(separator: " | ")))))
+
+        if requireTwoSpeakerProbe {
+            let coverageStart = diarizationFirstStart ?? .infinity
+            let coverageEnd = diarizationLastEnd ?? 0
+            let headLag = max(0, coverageStart - (processedTimeline.firstTime ?? 0))
+            let coverageLag = max(0, processedTimeline.span - coverageEnd)
+            let liveOK = diarization.updateCount > 0 && diarization.singleSpeakerFrames > 0 && headLag <= 0.35 && coverageLag <= 0.35 && diarizationMaxGap <= 0.35
+            checks.append(.init(name: "live_diarization", verdict: liveOK ? .pass : .warning,
+                detail: "frame \(diarization.updateCount) · head lag \(Self.ms(headLag)) ms · tail lag \(Self.ms(coverageLag)) ms · max gap \(Self.ms(diarizationMaxGap)) ms"))
+
+            let stable = stableSingleSpeakerSeconds.filter { $0.value >= 0.50 }
+            let epochs = Dictionary(grouping: stable.keys, by: { $0.split(separator: ":").first.map(String.init) ?? "" })
+            let sameEpochPair = epochs.values.contains { $0.count >= 2 }
+            checks.append(.init(name: "two_speaker_slots", verdict: sameEpochPair ? .pass : .warning,
+                detail: sameEpochPair ? "같은 diarizer identity epoch 안에서 0.5초 이상 안정된 서로 다른 두 slot을 관측했습니다."
+                    : "recovery epoch 변화는 두 화자로 세지 않습니다. 같은 epoch에서 안정된 두 단일화자 구간이 필요합니다. evidence: \(stable)"))
+
+            let overlapWindowValid = overlapProbeStart != nil && overlapProbeEnd != nil
+            checks.append(.init(name: "overlap_detected",
+                verdict: overlapWindowValid && overlapFramesInsideProbe > 0 ? .pass : .warning,
+                detail: overlapWindowValid ? "표시한 overlap probe window 내부 frame \(overlapFramesInsideProbe)개"
+                    : "검증 중 '겹쳐 말하기 시작'과 '겹쳐 말하기 종료'를 눌러 expected overlap source-time window를 명시하세요."))
+
+            checks.append(.init(name: "diarizer_model_bundled", verdict: diarizerModelBundled ? .pass : .fail,
+                detail: diarizerModelBundled ? "LS-EEND 100ms 모델이 앱 번들에 포함되어 있습니다."
+                                            : "필수 LS-EEND 모델이 앱 번들에 없습니다."))
+            checks.append(.init(name: "separator_model_bundled", verdict: separatorModelBundled ? .pass : .fail,
+                detail: separatorModelBundled ? "Separator.mlmodelc가 앱 번들에 포함되어 있습니다."
+                                             : "필수 동시발화 Separator.mlmodelc가 앱 번들에 없습니다."))
+        }
+
+        let orchestration = ProductionOrchestrationContract.run()
+        checks.append(.init(name: "production_orchestration_contract", verdict: orchestration.0 ? .pass : .fail, detail: orchestration.1))
 
         checks.append(.init(name: "pipeline_warnings",
             verdict: pipelineWarnings.isEmpty ? .pass : .warning,
@@ -666,7 +851,7 @@ final class DeviceValidationMetricStore {
 
         let verdict: DeviceValidationVerdict
         if checks.contains(where: { $0.verdict == .fail }) { verdict = .fail }
-        else if checks.contains(where: { $0.verdict == .warning }) { verdict = .warning }
+        else if checks.contains(where: { $0.verdict == .warning || $0.verdict == .notTested }) { verdict = .warning }
         else { verdict = .pass }
 
         let firstAudioLatency: Double? = {
@@ -696,11 +881,14 @@ final class DeviceValidationMetricStore {
             analyzerOverlapSeconds: analyzerTimeline.overlapSeconds,
             sttPrepared: sttPrepared, speechAppendChunks: speechAppendChunks,
             speechAppendFrames: speechAppendFrames, speechResults: speechResults,
-            finalSpeechResults: finalSpeechResults,
+            finalSpeechResults: finalSpeechResults, semanticSpeechResults: semanticSpeechResults,
+            invalidTimedSpeechResults: invalidTimedSpeechResults,
             captureRequestToFirstAudio: firstAudioLatency,
             firstAudioToFirstSpeechResult: speechLatency,
             maxInputRMSDB: maxInputRMSDB, maxInputPeakDB: maxInputPeakDB,
-            screenshotContinuity: screenshot,
+            screenshotContinuity: screenshot, speechTrace: speechTrace, diarization: diarization,
+            separatorModelBundled: separatorModelBundled,
+            diarizerModelBundled: diarizerModelBundled,
             pipelineWarnings: pipelineWarnings.sorted(), errors: errors,
             checks: checks, verdict: verdict
         )
@@ -734,8 +922,21 @@ final class DeviceValidationController: ObservableObject {
     private var input: SystemAudioInput?
     private var runTask: Task<Void, Never>?
     private var stopRequested = false
+    private var activeMetrics: DeviceValidationMetricStore?
 
     var combinedReport: DeviceValidationReport { DeviceValidationReport.make(sessions: sessions) }
+
+    func beginOverlapProbe() {
+        guard let metrics = activeMetrics, let t = metrics.currentSourceTime else { return }
+        metrics.markOverlapProbe(start: t)
+        status = "겹쳐 말하기 구간 기록 중… 종료 버튼을 누를 때까지 두 사람이 동시에 말하세요."
+    }
+
+    func endOverlapProbe() {
+        guard let metrics = activeMetrics, let t = metrics.currentSourceTime else { return }
+        metrics.endOverlapProbe(end: t)
+        status = "overlap probe 구간 기록 완료 · 계속 재생한 뒤 검증 정지하세요."
+    }
 
     func start(language: SourceLanguage) {
         guard !running else { return }
@@ -766,10 +967,24 @@ final class DeviceValidationController: ObservableObject {
     }
 
     private func run(language: SourceLanguage) async {
-        let metrics = DeviceValidationMetricStore(requireScreenshotProbe: true)
+        let metrics = DeviceValidationMetricStore(requireScreenshotProbe: true, requireTwoSpeakerProbe: true)
+        activeMetrics = metrics
         let pipeline = AudioPreprocessor()
         let speech = AppleSpeechEngine()
         let input = SystemAudioInput()
+        let liveAnalysisPreparation = OptionalProviderPreparation(serializeAnalysisPreparation: true)
+        await liveAnalysisPreparation.startAvailable(analysis: true, enhancement: false)
+        metrics.recordSeparatorModelBundled(Bundle.main.url(forResource: "Separator", withExtension: "mlmodelc", subdirectory: "Separation") != nil)
+        if let resources = Bundle.main.resourceURL {
+            var isDir: ObjCBool = false
+            let lseend = resources.appendingPathComponent(
+                "Diarization/LSEEND/ls_eend_dih3_100ms.mlmodelc", isDirectory: true)
+            metrics.recordDiarizerModelBundled(
+                FileManager.default.fileExists(atPath: lseend.path, isDirectory: &isDir) && isDir.boolValue)
+        } else {
+            metrics.recordDiarizerModelBundled(false)
+        }
+        var liveAnalysisConnected = false
         var failure: Error?
         var speechPrepared = false
         var rawAudioForScreenshot = 0.0
@@ -778,8 +993,9 @@ final class DeviceValidationController: ObservableObject {
 
         do {
             try Task.checkCancellation()
-            try await speech.prepare(language: language, result: { _, final, _, _, _ in
-                metrics.recordSpeechResult(final: final)
+            try await speech.prepare(language: language, result: { text, final, start, end, finalizedThrough, timedSpans in
+                metrics.recordSpeechResult(text: text, final: final, start: start, end: end,
+                                           finalizedThrough: finalizedThrough, timedSpans: timedSpans)
             }, failure: { message in
                 metrics.recordError("STT 비동기 오류: \(message)")
             }, inputObserver: { buffer, startTime in
@@ -793,7 +1009,7 @@ final class DeviceValidationController: ObservableObject {
             metrics.markCaptureRequested()
             let sequence = try await input.start()
             self.input = input
-            status = "대상 선택 후 실제 음성을 20~30초 재생하세요."
+            status = "대상 선택 후 두 사람이 번갈아 말하고, 중간 4~6초는 일부러 겹쳐 말하는 실제 음성을 20~30초 재생하세요."
 
             for try await chunk in sequence {
                 try Task.checkCancellation()
@@ -818,8 +1034,18 @@ final class DeviceValidationController: ObservableObject {
                         }
                     }
                 }
+                if !liveAnalysisConnected {
+                    let ready = await liveAnalysisPreparation.takeReady()
+                    metrics.recordDiarizationStatus(ready.analysisStatus)
+                    if let analysis = ready.analysis {
+                        await pipeline.installPrepared(analysis: analysis, enhancement: nil)
+                        liveAnalysisConnected = true
+                        metrics.recordDiarizationStatus("화자 분석 연결됨 · 실시간 메타데이터")
+                    }
+                }
                 let (processed, values) = try await pipeline.process(chunk)
                 metrics.recordPipelineMetrics(values)
+                metrics.recordDiarization(await pipeline.takeAnalysisUpdates())
                 for output in processed {
                     metrics.recordProcessed(output)
                     try speech.append(output)
@@ -834,12 +1060,29 @@ final class DeviceValidationController: ObservableObject {
         }
 
         if let screenshotTask { await screenshotTask.value }
+        // A loader may become ready just after the final PCM. Like AppModel's
+        // natural-EOF path, make one nonblocking mailbox handoff before closing it.
+        // Explicit Stop/error must never await/attach optional analysis here.
+        if failure == nil && !Task.isCancelled && !stopRequested && !liveAnalysisConnected {
+            let finalReady = await liveAnalysisPreparation.takeReady()
+            metrics.recordDiarizationStatus(finalReady.analysisStatus)
+            if let analysis = finalReady.analysis {
+                await pipeline.installPrepared(analysis: analysis, enhancement: nil)
+                liveAnalysisConnected = true
+                metrics.recordDiarizationStatus("화자 분석 연결됨 · EOF 백필")
+            }
+        }
+        await liveAnalysisPreparation.cancel()
         await input.stop()
+        // Stop may have been requested by the UI already; stop() coalesces
+        // both callers, and stopFailure is only final after the shared stop.
+        metrics.recordNativeStopFailure(input.stopFailure)
         self.input = nil
 
         if failure == nil {
             do {
                 let tails = try await pipeline.finish(cancelAnalysis: false)
+                metrics.recordDiarization(await pipeline.takeAnalysisUpdates())
                 for output in tails {
                     metrics.recordProcessed(output)
                     try speech.append(output)
@@ -859,6 +1102,7 @@ final class DeviceValidationController: ObservableObject {
         let report = metrics.finish(userStopped: stopRequested)
         sessions.append(report)
         refreshExport()
+        activeMetrics = nil
         running = false
         runTask = nil
 

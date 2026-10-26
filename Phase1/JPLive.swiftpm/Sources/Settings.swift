@@ -39,7 +39,7 @@ struct SettingsView: View {
                     Text(model.morphologyStatus).font(.caption)
                 }
                 Section("입력 및 처리 상태") {
-                    Text("소스 버전 · local-stage7-2026-09-21").font(.caption)
+                    Text("소스 버전 · chat-stage8.9C-R5M-2026-10-14").font(.caption)
                     LabeledContent("입력 RMS", value: String(format: "%.1f dBFS", model.metrics.rmsDB))
                     LabeledContent("입력 peak", value: String(format: "%.1f dBFS", model.metrics.peakDB))
                     LabeledContent("보정 gain", value: String(format: "%.1f dB", model.metrics.gainDB))
@@ -64,17 +64,11 @@ struct SettingsView: View {
                     LabeledContent("실행 시간", value: String(format: "%.1f초", value.elapsed))
                     LabeledContent("빠른 STT 원본 시각 차이", value: String(format: "%.3f초", value.input.sourceBacklog))
                     LabeledContent("입력 대기 오디오", value: String(format: "%.3f초 · 최대 %.3f초", value.input.pendingAudio, value.input.peakPendingAudio))
-                    LabeledContent("보정 입력 대기열", value: String(format: "%.3f초 · 최대 %.3f초", value.quality.backlog, value.quality.peakBacklog))
-                    LabeledContent("보정 수신 / STT 전달", value: sourceTime(value.quality.acceptedThrough) + " / " + sourceTime(value.quality.analyzerInputThrough))
-                    LabeledContent("보정 인식 결과 시각", value: sourceTime(value.quality.recognitionThrough))
-                    LabeledContent("보정 생략 버퍼", value: String(value.quality.skippedChunks))
-                    LabeledContent("보정 과부하 중단", value: String(value.quality.overloadStops))
-                    LabeledContent("적용한 자막 보정", value: String(value.qualityRevisions))
-                    LabeledContent("화자 분석 연결 시각", value: sourceTime(value.quality.analysisActivatedAt))
-                    LabeledContent("음성 개선 연결 시각", value: sourceTime(value.quality.enhancementActivatedAt))
+                    LabeledContent("실시간 화자 분석", value: value.diarization.status)
+                    LabeledContent("실시간 화자 분석 시작", value: sourceTime(value.diarization.analysisActivatedAt))
+                    LabeledContent("화자 분석 frame", value: "\(value.diarization.updateCount) · 단일 \(value.diarization.singleSpeakerFrames) · 겹침 \(value.diarization.overlapFrames)")
+                    LabeledContent("관측 화자 slot", value: value.diarization.distinctSpeakerSlots.map(String.init).joined(separator: ", ").isEmpty ? "없음" : value.diarization.distinctSpeakerSlots.map(String.init).joined(separator: ", "))
                     LabeledContent("보관 자막", value: String(value.captionCount))
-                    if let reason = value.quality.stoppedReason { Text(reason).foregroundStyle(.orange) }
-                    Text("빠른 STT 지연은 입력 전달 기준입니다. 보정 대기열 수치는 내부 분석 대기·Apple 인식 시간을 제외하므로 수신/전달/인식 시각도 함께 확인하세요. 생략 수에는 모델 준비 전과 보정 중단 후의 버퍼가 포함됩니다.").font(.caption)
                     ShareLink("진단값 공유", item: diagnosticsJSON)
                 }
             }.navigationTitle("설정").toolbar { Button("완료") { dismiss() } }

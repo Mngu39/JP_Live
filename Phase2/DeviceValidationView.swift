@@ -11,11 +11,12 @@ struct DeviceValidationView: View {
             Form {
                 Section("사용 방법") {
                     Text("1. 검증 시작 → 화면 전체 공유를 선택")
-                    Text("2. 유튜브 등에서 실제 음성/대사를 20~30초 재생")
+                    Text("2. 유튜브 등에서 서로 다른 두 사람이 번갈아 말하는 실제 음성을 20~30초 재생")
                     Text("3. 실제 PCM 약 5초 후 현재 오디오 SCStream에 screen output을 잠깐 붙여 고해상도 프레임 1장을 받고 즉시 제거합니다")
-                    Text("4. 스크린샷 뒤 최소 5초 이상 계속 재생한 다음 이 앱으로 돌아와 검증 정지")
-                    Text("5. 같은 과정을 한 번 더 실행하면 stop → restart와 시간축 초기화까지 검증")
-                    Text("전사 문장은 저장하지 않고 PCM/STT 수치와 PASS/FAIL만 JSON에 기록합니다.")
+                    Text("4. 두 사람이 실제로 겹쳐 말하기 직전에 ‘겹쳐 말하기 시작’, 끝난 직후 ‘겹쳐 말하기 종료’를 눌러 expected overlap 구간을 기록")
+                    Text("5. 스크린샷 뒤 최소 5초 이상 계속 재생한 다음 이 앱으로 돌아와 검증 정지")
+                    Text("6. 두 세션 모두 '검증 정지'로 직접 종료하고 다시 시작해야 stop → restart 검증이 PASS합니다")
+                    Text("진단을 위해 최근 Apple STT callback 원문을 최대 48개까지 JSON에 함께 기록합니다. 공유 전에 내용에 민감한 대화가 없는지 확인하세요.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
@@ -33,7 +34,11 @@ struct DeviceValidationView: View {
                         LabeledContent("raw PCM", value: "\(latest.rawChunks) chunks · \(String(format: "%.2f", latest.rawAudioDuration)) s")
                         LabeledContent("전처리 PCM", value: "\(latest.processedChunks) chunks · \(String(format: "%.2f", latest.processedAudioDuration)) s")
                         LabeledContent("Analyzer 입력", value: "\(latest.analyzerChunks) chunks · \(String(format: "%.2f", latest.analyzerAudioDuration)) s")
-                        LabeledContent("STT 결과", value: "\(latest.speechResults) · final \(latest.finalSpeechResults)")
+                        LabeledContent("STT 결과", value: "\(latest.speechResults) callbacks · text \(latest.semanticSpeechResults) · timed-invalid \(latest.invalidTimedSpeechResults)")
+                        LabeledContent("화자 분석", value: latest.diarization.status)
+                        LabeledContent("화자 slot", value: latest.diarization.distinctSpeakerSlots.map(String.init).joined(separator: ", ").isEmpty ? "없음" : latest.diarization.distinctSpeakerSlots.map(String.init).joined(separator: ", "))
+                        LabeledContent("화자 모델", value: latest.diarizerModelBundled ? "BUNDLED" : "MISSING")
+                        LabeledContent("분리 모델", value: latest.separatorModelBundled ? "BUNDLED" : "MISSING")
                         LabeledContent("same-stream 스크린샷", value: latest.screenshotContinuity.succeeded ? "SUCCESS" : (latest.screenshotContinuity.attempted ? "FAIL" : "NOT TESTED"))
                         LabeledContent("스크린샷 연속성", value: verdictTitle(latest.screenshotContinuity.verdict))
                         ForEach(latest.checks) { check in
@@ -51,6 +56,10 @@ struct DeviceValidationView: View {
 
                 Section("실행") {
                     if controller.running {
+                        HStack {
+                            Button("겹쳐 말하기 시작", systemImage: "person.2.wave.2") { controller.beginOverlapProbe() }
+                            Button("겹쳐 말하기 종료", systemImage: "checkmark.circle") { controller.endOverlapProbe() }
+                        }
                         Button("검증 정지", systemImage: "stop.fill") {
                             Task { await controller.stop() }
                         }

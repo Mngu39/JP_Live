@@ -15,11 +15,17 @@ struct PCMChunk: @unchecked Sendable {
 
 @MainActor protocol AudioInput: AnyObject {
     var progress: AudioInputProgress? { get }
+    // Non-nil after an attempted native teardown failed. It must not be reported
+    // as an orderly Stop, even though all input callbacks have been deactivated.
+    var stopFailure: String? { get }
     func start() async throws -> AsyncThrowingStream<PCMChunk, Error>
     func stop() async
 }
 
-extension AudioInput { var progress: AudioInputProgress? { nil } }
+extension AudioInput {
+    var progress: AudioInputProgress? { nil }
+    var stopFailure: String? { nil } // File input and simulator stub have no native stream.
+}
 
 struct AudioInputSnapshot: Codable, Sendable {
     var capturedThrough: Double = 0
@@ -59,43 +65,58 @@ final class AudioInputProgress: @unchecked Sendable {
     }
 }
 
-struct QualityPassDiagnostics: Codable, Sendable {
-    var backlog: Double = 0
-    var peakBacklog: Double = 0
-    var skippedChunks: Int = 0
-    var overloadStops: Int = 0
+struct SpeechResultTrace: Codable, Sendable {
+    var text: String
+    var final: Bool
+    var start: Double
+    var end: Double
+    var finalizedThrough: Double?
+    var timedSpans: [TimedTextSpan] = []
+}
+
+struct DisplayedCaptionTrace: Codable, Sendable {
+    var text: String
+    var final: Bool
+    var start: Double
+    var end: Double
+    var speaker: Int?
+    var gutter: String
+    var separated: Bool
+    var separationLane: Int? = nil
+    var speakerSpans: [SpeakerSpan] = []
+}
+
+struct DiarizationFrameTrace: Codable, Sendable {
+    var speechProbability: Float
+    var activeSpeakers: Int
+    var start: Double
+    var end: Double
+    var speakerSlot: Int?
+    var identityEpoch: Int = 0
+}
+
+struct DiarizationDiagnostics: Codable, Sendable {
+    var status = "화자 분석 준비 전"
     var analysisActivatedAt: Double?
-    var enhancementActivatedAt: Double?
-    var stoppedReason: String?
-    var acceptedThrough: Double?
-    var analyzerInputThrough: Double?
-    var recognitionThrough: Double?
+    var updateCount = 0
+    var singleSpeakerFrames = 0
+    var overlapFrames = 0
+    var distinctSpeakerSlots: [Int] = []
+    var latestEnd: Double?
+    // Bounded source-time evidence for post-run root-cause reconstruction.
+    var recentFrames: [DiarizationFrameTrace] = []
 }
 
 struct LivePipelineDiagnostics: Codable, Sendable {
     var input = AudioInputSnapshot()
-    var quality = QualityPassDiagnostics()
-    var qualityRevisions: Int = 0
     var captionCount: Int = 0
     var elapsed: Double = 0
-}
-
-// Injection seam for lifecycle/backpressure tests; production still uses the
-// same Apple SpeechTranscriber implementation, never a second STT backend.
-@MainActor protocol QualitySpeechSink: AnyObject {
-    func prepareForQuality(language: SourceLanguage,
-                           result: @escaping (String, Bool, Double, Double, Double?) -> Void,
-                           failure: @escaping (String) -> Void) async throws
-    func append(_ chunk: PCMChunk) throws
-    func finish(aborting: Bool) async throws
-}
-
-extension AppleSpeechEngine: QualitySpeechSink {
-    func prepareForQuality(language: SourceLanguage,
-                           result: @escaping (String, Bool, Double, Double, Double?) -> Void,
-                           failure: @escaping (String) -> Void) async throws {
-        try await prepare(language: language, result: result, failure: failure)
-    }
+    // Bounded, user-exported evidence only. This lets a real-device report distinguish
+    // recognizer errors from TranscriptBuffer aggregation without changing STT policy.
+    var primarySpeech: [SpeechResultTrace] = []
+    var displayedCaptions: [DisplayedCaptionTrace] = []
+    var diarization = DiarizationDiagnostics()
+    var separation = SeparationDiagnostics()
 }
 
 final class FileAudioInput: AudioInput {
@@ -218,7 +239,7 @@ final class AppleSpeechEngine {
     private var failed: String?
     private var inputObserver: ((AVAudioPCMBuffer, CMTime?) -> Void)?
     private var didStart = false
-    func prepare(language: SourceLanguage, result: @escaping (String, Bool, Double, Double, Double?) -> Void,
+    func prepare(language: SourceLanguage, result: @escaping (String, Bool, Double, Double, Double?, [TimedTextSpan]) -> Void,
                  failure: @escaping (String) -> Void,
                  inputObserver: ((AVAudioPCMBuffer, CMTime?) -> Void)? = nil) async throws {
         guard SpeechTranscriber.isAvailable,
@@ -247,8 +268,10 @@ final class AppleSpeechEngine {
             do {
                 for try await r in transcriber.results {
                     let frontier = r.resultsFinalizationTime.seconds
-                    result(String(r.text.characters), r.isFinal, r.range.start.seconds,
-                           CMTimeRangeGetEnd(r.range).seconds, frontier.isFinite ? frontier : nil)
+                    let decoded = Self.decodeTimedText(r.text)
+                    result(decoded.text, r.isFinal, r.range.start.seconds,
+                           CMTimeRangeGetEnd(r.range).seconds,
+                           frontier.isFinite ? frontier : nil, decoded.spans)
                 }
             } catch {
                 if !Task.isCancelled { self.failed = error.localizedDescription; failure(error.localizedDescription) }
@@ -257,6 +280,41 @@ final class AppleSpeechEngine {
         try await analyzer.start(inputSequence: sequence)
         didStart = true
     }
+    private static func decodeTimedText(_ attributed: AttributedString) -> (text: String, spans: [TimedTextSpan]) {
+        let raw = String(attributed.characters)
+        guard !raw.isEmpty else { return ("", []) }
+        let ns = raw as NSString
+        let nonWhitespace = CharacterSet.whitespacesAndNewlines.inverted
+        let first = ns.rangeOfCharacter(from: nonWhitespace)
+        guard first.location != NSNotFound else { return ("", []) }
+        let last = ns.rangeOfCharacter(from: nonWhitespace, options: .backwards)
+        let trimStart = first.location
+        let trimEnd = last.location + last.length
+        let trimmed = ns.substring(with: NSRange(location: trimStart, length: trimEnd-trimStart))
+
+        var spans: [TimedTextSpan] = []
+        var cursor = 0
+        for run in attributed.runs {
+            let runText = String(attributed[run.range].characters)
+            let runStart = cursor
+            let runEnd = cursor + runText.utf16.count
+            cursor = runEnd
+            guard let time = run.audioTimeRange else { continue }
+            let start = time.start.seconds
+            let end = CMTimeRangeGetEnd(time).seconds
+            guard start.isFinite, end.isFinite, end > start else { continue }
+            let clippedStart = max(runStart, trimStart)
+            let clippedEnd = min(runEnd, trimEnd)
+            guard clippedEnd > clippedStart else { continue }
+            spans.append(TimedTextSpan(
+                utf16Start: clippedStart-trimStart,
+                utf16End: clippedEnd-trimStart,
+                start: start, end: end
+            ))
+        }
+        return (trimmed, spans.filter(\.isValid))
+    }
+
     func append(_ chunk: PCMChunk) throws {
         if let failed { throw AppFailure.message("STT 오류: " + failed) }
         guard let converter else { throw AppFailure.message("STT가 준비되지 않았습니다.") }

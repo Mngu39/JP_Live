@@ -39,7 +39,7 @@ struct TranslationBacklog {
     mutating func complete(_ id: UUID) {
         inFlight.remove(id); failures[id] = nil; eligibleAt[id] = nil
     }
-    // A delayed quality-STT correction may change a row while its old translation is
+    // An overlap replacement or other transcript edit may change a row while its old translation is
     // queued or in flight. Invalidate bookkeeping so the corrected source can be queued
     // immediately; a stale response is still rejected by AppModel's source equality guard.
     mutating func invalidate(_ ids: [UUID]) {
