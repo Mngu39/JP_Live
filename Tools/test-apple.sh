@@ -22,15 +22,37 @@ python3 -B "$ROOT/Tools/source_checksums.py" normalize \
 python3 -B "$ROOT/Tests/test_source_checksums.py" 2>&1 | tee "$RUN/checksum-tests.log"
 python3 -B "$ROOT/Tests/test_sudachi_resources.py" 2>&1 | tee "$RUN/sudachi-resource-tests.log"
 python3 -B "$ROOT/Tests/test_separator_assets.py" 2>&1 | tee "$RUN/separator-asset-tests.log"
+python3 -B "$ROOT/Tests/test_diarizer_assets.py" 2>&1 | tee "$RUN/diarizer-asset-tests.log"
+python3 -B "$ROOT/Tests/test_vad_assets.py" 2>&1 | tee "$RUN/vad-asset-tests.log"
 if [[ "$PHASE" == 2 ]]; then
-  # The separator is prepared explicitly in a separate model stage. An empty
-  # resource directory keeps model-free builds honest and functional.
-  mkdir -p "$ROOT/BuildOutputs/Separation"
-  python3 -B "$ROOT/Tools/separator_assets.py" "$ROOT/BuildOutputs/Separation" 2>&1 | tee "$RUN/separator-assets.log"
-  if [[ -f "$ROOT/BuildOutputs/Separation/asset-manifest.json" ]]; then
-    cp "$ROOT/BuildOutputs/Separation/asset-manifest.json" "$RUN/separator-manifest.log"
-    cp "$ROOT/BuildOutputs/Separation/conversion-report.json" "$RUN/separator-conversion.log"
+  # Live two-speaker diarization is a required offline-bundled Phase 2 feature.
+  # Never allow the app to depend on first-run runtime model download/network.
+  if [[ ! -f "$ROOT/BuildOutputs/Diarization/asset-manifest.json" ]]; then
+    echo "Required bundled LS-EEND diarizer is not prepared. Run: bash Tools/prepare-diarizer-macos.sh" >&2
+    exit 1
   fi
+  python3 -B "$ROOT/Tools/diarizer_assets.py" "$ROOT/BuildOutputs/Diarization" 2>&1 | tee "$RUN/diarizer-assets.log"
+  cp "$ROOT/BuildOutputs/Diarization/asset-manifest.json" "$RUN/diarizer-manifest.log"
+  cp "$ROOT/BuildOutputs/Diarization/source.json" "$RUN/diarizer-source.log"
+
+  if [[ ! -f "$ROOT/BuildOutputs/VAD/asset-manifest.json" ]]; then
+    echo "Required bundled Silero VAD is not prepared. Run: bash Tools/prepare-vad-macos.sh" >&2
+    exit 1
+  fi
+  python3 -B "$ROOT/Tools/vad_assets.py" "$ROOT/BuildOutputs/VAD" 2>&1 | tee "$RUN/vad-assets.log"
+  cp "$ROOT/BuildOutputs/VAD/asset-manifest.json" "$RUN/vad-manifest.log"
+  cp "$ROOT/BuildOutputs/VAD/source.json" "$RUN/vad-source.log"
+
+  # Two-speaker overlap separation is a required Phase 2 feature, not an optional
+  # model-free fallback. The workflow prepares it before this script; a developer
+  # running Phase 2 locally must do the same. Never emit PASS.txt without it.
+  if [[ ! -f "$ROOT/BuildOutputs/Separation/asset-manifest.json" ]]; then
+    echo "Required two-speaker separator is not prepared. Run: bash Tools/prepare-separator-macos.sh" >&2
+    exit 1
+  fi
+  python3 -B "$ROOT/Tools/separator_assets.py" "$ROOT/BuildOutputs/Separation" 2>&1 | tee "$RUN/separator-assets.log"
+  cp "$ROOT/BuildOutputs/Separation/asset-manifest.json" "$RUN/separator-manifest.log"
+  cp "$ROOT/BuildOutputs/Separation/conversion-report.json" "$RUN/separator-conversion.log"
   # Required native app dependency. Prepare before Xcode discovers build inputs.
   bash "$ROOT/Tools/build-sudachi-macos.sh" 2>&1 | tee "$RUN/sudachi-build.log"
   cp "$ROOT/BuildOutputs/Sudachi/Resources/Sudachi/asset-manifest.json" "$RUN/sudachi-assets.log"
@@ -73,6 +95,14 @@ if [[ "$PHASE" == 2 ]]; then
   cmp "$RESOLVED" "$RUN/Package.resolved"
   APP_PATH="$(find "$RUN/DeviceDerivedData/Build/Products/Release-iphoneos" -maxdepth 1 -type d -name 'JPLive.app' -print -quit)"
   test -n "$APP_PATH" -a -d "$APP_PATH"
+  # Prove that the required generated resources made it into the actual device app,
+  # not merely that they existed beside the Xcode project during the build.
+  test -d "$APP_PATH/Separation/Separator.mlmodelc"
+  python3 -B "$ROOT/Tools/separator_assets.py" "$APP_PATH/Separation" 2>&1 | tee "$RUN/separator-bundle-assets.log"
+  test -d "$APP_PATH/Diarization/LSEEND/ls_eend_dih3_100ms.mlmodelc"
+  python3 -B "$ROOT/Tools/diarizer_assets.py" "$APP_PATH/Diarization" 2>&1 | tee "$RUN/diarizer-bundle-assets.log"
+  test -d "$APP_PATH/VAD/silero-vad-unified-256ms-v6.2.1.mlmodelc"
+  python3 -B "$ROOT/Tools/vad_assets.py" "$APP_PATH/VAD" 2>&1 | tee "$RUN/vad-bundle-assets.log"
   IPA_STAGE="$RUN/UnsignedIPA"
   mkdir -p "$IPA_STAGE/Payload"
   ditto "$APP_PATH" "$IPA_STAGE/Payload/JPLive.app"

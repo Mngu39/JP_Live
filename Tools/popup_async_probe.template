@@ -1,0 +1,110 @@
+import Foundation
+
+enum Lang { case japanese }
+struct WordToken { let start: Int; let end: Int; let surface: String }
+struct Caption { let source: String; let language: Lang }
+struct Reconstruction { let units: [WordToken] }
+
+enum ProbeError: Error { case failed }
+actor WorkerClient {
+    static let shared = WorkerClient()
+    private var translationPending: CheckedContinuation<String, Never>?
+    private var translationStarted: CheckedContinuation<Void, Never>?
+    private var reconstructionPending: CheckedContinuation<Void, Never>?
+    private var reconstructionStarted: CheckedContinuation<Void, Never>?
+    var reconstructCalls = 0
+    var suspendReconstruction = false
+    func translate(_ source:String, language:Lang) async throws -> String {
+        return await withCheckedContinuation { cont in
+            translationPending=cont
+            translationStarted?.resume()
+            translationStarted=nil
+        }
+    }
+    func waitTranslate() async {
+        if translationPending != nil {return}
+        await withCheckedContinuation { translationStarted=$0 }
+    }
+    func finishTranslate(_ result:String) { translationPending?.resume(returning:result);translationPending=nil }
+    func reconstruct(_ source: Caption, translation:String, tokens:[WordToken]) async throws -> Reconstruction {
+        reconstructCalls+=1
+        if suspendReconstruction {
+            await withCheckedContinuation { (cont:CheckedContinuation<Void,Never>) in
+                reconstructionPending=cont
+                reconstructionStarted?.resume();reconstructionStarted=nil
+            }
+        }
+        return Reconstruction(units:tokens)
+    }
+    func waitReconstruct() async {
+        if reconstructionPending != nil{return}
+        await withCheckedContinuation { reconstructionStarted=$0 }
+    }
+    func finishReconstruct() { reconstructionPending?.resume();reconstructionPending=nil }
+    func reset() {reconstructCalls=0;suspendReconstruction=false}
+}
+@MainActor final class PopupHarness {
+    var morphologyGeneration=UUID()
+    var row=Caption(source:"fragment",language:.japanese)
+    var popupContextKey:String{row.source}
+    var selectionCurrent=true
+    var tokensReady=true
+    var token:WordToken?=nil
+    var baseTokens=[WordToken(start:0,end:2,surface:"fr")]
+    var baseTranslation=""
+    var reconstruction:Reconstruction?=nil
+    var useAI=false
+    var aiBusy=false
+    var error=""
+    var tokens:[WordToken]{useAI ? reconstruction?.units ?? baseTokens : baseTokens}
+    func changeContext(){
+        row=Caption(source:"full sentence",language:.japanese)
+        morphologyGeneration=UUID()
+        baseTranslation=""
+        reconstruction=nil
+    }
+__TOGGLE_AI_METHOD__
+}
+@MainActor @main struct Runner {
+    static func main() async {
+        let mock=WorkerClient.shared
+            let popup=PopupHarness()
+            let call=Task { await popup.toggleAI() }
+            await mock.waitTranslate()
+            popup.changeContext()
+            await mock.finishTranslate("OLD FRAGMENT TRANSLATION")
+            await call.value
+            let oldText=popup.baseTranslation
+            let oldReconstruction=popup.reconstruction
+            let calls=await mock.reconstructCalls
+            guard oldText.isEmpty && oldReconstruction == nil && calls == 0 else {
+                print("FAIL stale response leaked: text=\(oldText) reconstructCalls=\(calls)"); exit(1)
+            }
+            print("PASS: late translation after context change does not write or reconstruct")
+            await mock.reset()
+            let popup2=PopupHarness()
+            let call2=Task { await popup2.toggleAI() }
+            await mock.waitTranslate()
+            await mock.finishTranslate("VALID")
+            await call2.value
+            let validText=popup2.baseTranslation
+            let validAI=popup2.useAI
+            let validReconstruction=popup2.reconstruction
+            guard validText == "VALID" && validAI && validReconstruction != nil else {print("FAIL valid result");exit(1)}
+            print("PASS: unchanged context completes AI reconstruction")
+            await mock.reset()
+            await mock.setSuspendedReconstruction()
+            let popup3=PopupHarness()
+            let call3=Task { await popup3.toggleAI() }
+            await mock.waitTranslate();await mock.finishTranslate("VALID")
+            await mock.waitReconstruct()
+            popup3.changeContext()
+            await mock.finishReconstruct()
+            await call3.value
+            let late=popup3.reconstruction
+            let lateAI=popup3.useAI
+            guard late == nil && !lateAI else {print("FAIL stale reconstruction");exit(1)}
+            print("PASS: late reconstruction after context change is rejected")
+    }
+}
+extension WorkerClient { func setSuspendedReconstruction(){suspendReconstruction=true} }

@@ -1,4 +1,4 @@
-"""Explicit macOS model preparation. Does not run as part of normal app CI."""
+"""Pinned macOS separator preparation used by the required Phase 2 CI gate and local builds."""
 from pathlib import Path
 import argparse
 import importlib.metadata

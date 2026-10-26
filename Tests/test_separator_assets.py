@@ -113,6 +113,19 @@ class SeparatorAssetsTests(unittest.TestCase):
         self.manifest['sha256'] = assets.asset_hashes(self.root); self.save()
         with self.assertRaises(ValueError): assets.verify(self.root)
 
+    def test_phase2_ci_requires_and_prepares_separator(self):
+        root = Path(__file__).resolve().parents[1]
+        apple = (root/'Tools/test-apple.sh').read_text(encoding='utf-8')
+        workflow = (root/'.github/workflows/apple-validation.yml').read_text(encoding='utf-8')
+        self.assertIn('Required two-speaker separator is not prepared', apple)
+        self.assertIn('BuildOutputs/Separation/asset-manifest.json', apple)
+        self.assertIn('APP_PATH/Separation/Separator.mlmodelc', apple)
+        self.assertIn('separator-bundle-assets.log', apple)
+        self.assertNotIn('An empty\n  # resource directory keeps model-free builds honest', apple)
+        self.assertIn('bash Tools/prepare-separator-macos.sh', workflow)
+        self.assertIn("python-version: '3.11'", workflow)
+        self.assertIn("inputs.phase == '2' && 120 || 45", workflow)
+
     def test_preflight_fails_on_windows_before_importing_ml_packages(self):
         with patch.object(exporter.platform, 'system', return_value='Windows'):
             with self.assertRaisesRegex(ValueError, 'require macOS'):
