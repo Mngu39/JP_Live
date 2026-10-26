@@ -1,15 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-for tool in cargo rustup python3 xcodebuild lipo; do
+for tool in cargo rustup python3.11 xcodebuild lipo; do
   command -v "$tool" >/dev/null || { echo "Missing $tool: native Sudachi requires macOS Rust/Xcode/Python." >&2; exit 1; }
 done
-python3 -c 'import sys; sys.exit("Sudachi resource preparation requires Python 3.10 or newer") if sys.version_info < (3, 10) else None'
+python3.11 -c 'import sys; sys.exit("Sudachi resource preparation requires Python 3.11") if sys.version_info[:2] != (3, 11) else None'
 mkdir -p "$ROOT/BuildOutputs"
 STAGE="$(mktemp -d "$ROOT/BuildOutputs/sudachi-stage.XXXXXX")"
 cp -R "$ROOT/Native/SudachiBridge" "$STAGE/Bridge"
 # Generated dependency locks and compiler outputs stay outside checksummed source.
-python3 -m venv "$STAGE/python"
+python3.11 -m venv "$STAGE/python"
 "$STAGE/python/bin/python" -m pip install --disable-pip-version-check 'SudachiPy==0.6.11' 'SudachiDict-full==20260723'
 "$STAGE/python/bin/python" "$ROOT/Tools/prepare-sudachi-resources.py" "$STAGE/Resources/Sudachi"
 cd "$STAGE/Bridge"
