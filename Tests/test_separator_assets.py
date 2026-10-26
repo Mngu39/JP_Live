@@ -256,6 +256,48 @@ class SeparatorAssetsTests(unittest.TestCase):
         self.assertIn('torch.nn.functional.pad(decoded, (0, 0, 0, requested-actual))', source)
         self.assertIn('return decoded[:, :requested, :]', source)
 
+    def test_upstream_torch_reference_runs_before_coreml_convert(self):
+        # Guard the exact native-crash sequence from the xcode-27 R5Q run.
+        # This is an AST source contract, not a macOS Core ML runtime test.
+        import ast
+        source = (TOOLS/'export_separator.py').read_text(encoding='utf-8')
+        tree = ast.parse(source)
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'main')
+        convert = [node for node in ast.walk(main) if isinstance(node, ast.Call)
+                   and isinstance(node.func, ast.Attribute) and node.func.attr == 'convert'
+                   and isinstance(node.func.value, ast.Name) and node.func.value.id == 'ct']
+        self.assertEqual(len(convert), 1)
+        reference_calls = [node for node in ast.walk(main) if isinstance(node, ast.Call)
+                           and isinstance(node.func, ast.Attribute) and node.func.attr == 'separate_batch']
+        self.assertEqual(len(reference_calls), 1)
+        self.assertLess(reference_calls[0].lineno, convert[0].lineno)
+        self.assertIn('Core ML conversion returned; checking converted-model parity', source)
+        self.assertIn('np.allclose(reference, actual, rtol=1e-3, atol=1e-3)', source)
+
+    def test_conversion_uses_saved_numpy_inputs_after_torch_reference(self):
+        # Reject regression to PyTorch Tensor.numpy() inside post-convert parity.
+        source = (TOOLS/'export_separator.py').read_text(encoding='utf-8')
+        after_convert = source.split('        model = ct.convert(', 1)[1]
+        self.assertNotIn('separator.separate_batch(', after_convert)
+        self.assertNotIn('wrapper(example)', after_convert)
+        self.assertNotIn('traced(example)', after_convert)
+        self.assertNotIn('example.numpy()', after_convert)
+        self.assertIn("model.predict({'mixture': mixture_numpy})", after_convert)
+
+    def test_source_compile_preserves_sudachi_failure_log(self):
+        # GitHub run #58 failed before Xcode at this step and uploaded no
+        # artifact. Require the stage log to survive a non-zero shell exit.
+        workflow = (TOOLS.parent/'.github/workflows/apple-validation.yml').read_text(encoding='utf-8')
+        step = workflow.split('      - name: Build required Sudachi native framework', 1)[1].split('      - name:', 1)[0]
+        self.assertIn('set -euo pipefail', step)
+        self.assertIn('mkdir -p BuildOutputs/compile-smoke', step)
+        self.assertIn('tee BuildOutputs/compile-smoke/sudachi-build.log', step)
+        self.assertIn('BuildOutputs/compile-smoke/*.log', workflow)
+        self.assertIn("options: ['full', 'compile-only']", workflow)
+        self.assertIn("if: inputs.phase != '2' or inputs.phase2_mode == 'full'", workflow.replace(' || ', ' or '))
+        self.assertIn("if: inputs.phase == '2'", workflow)
+
+
 
 if __name__ == '__main__':
     unittest.main()

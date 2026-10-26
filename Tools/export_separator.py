@@ -193,6 +193,28 @@ def main():
                  ('impulse', impulse), ('upstream-English-mixture', torch.from_numpy(speech[:64000].copy()).unsqueeze(0))]
         with torch.no_grad():
             traced = torch.jit.trace(wrapper, cases[0][1], check_trace=True)
+        # Do every PyTorch forward pass BEFORE entering coremltools conversion.
+        # On the xcode-27 runner, calling SpeechBrain separate_batch() after
+        # ct.convert() crashed CPython 3.11 in native code (PyEval_SaveThread).
+        # Retain independent numerical comparisons against the real upstream
+        # separator, but never invoke the Torch module again after ct.convert().
+        baselines = []
+        for label, example in cases:
+            print(f'PyTorch upstream/wrapper/trace parity: {label}', flush=True)
+            started = time.perf_counter()
+            with torch.no_grad():
+                reference = separator.separate_batch(example).cpu().numpy().copy()
+                wrapped = wrapper(example).cpu().numpy().copy()
+                traced_result = traced(example).cpu().numpy().copy()
+            for stage, value in [('wrapper', wrapped), ('trace', traced_result)]:
+                if (value.shape != (1, 64000, 2) or not np.isfinite(value).all()
+                        or not np.isfinite(reference).all()
+                        or not np.allclose(reference, value, rtol=1e-3, atol=1e-3)):
+                    raise ValueError(f'{label}: {stage} disagrees with official separate_batch')
+            # A NumPy copy avoids touching PyTorch Tensor objects after conversion.
+            baselines.append((label, example.numpy().copy(), reference,
+                              time.perf_counter() - started))
+        print('PyTorch parity passed; beginning Core ML conversion', flush=True)
         # coremltools 8.3's TorchScript frontend lacks aten::alias support.
         # Register exactly that value-preserving operator, not a generic
         # unsupported-op bypass. Keep full upstream-vs-CoreML parity checks.
@@ -205,21 +227,18 @@ def main():
             outputs=[ct.TensorType(name='stems', dtype=np.float32)], convert_to='mlprogram',
             minimum_deployment_target=ct.target.iOS18, compute_precision=ct.precision.FLOAT32,
             compute_units=ct.ComputeUnit.CPU_ONLY, debug=True)
+        print('Core ML conversion returned; checking converted-model parity', flush=True)
         checks = []
-        for label, example in cases:
+        for label, mixture_numpy, reference, preconversion_seconds in baselines:
             started = time.perf_counter()
-            with torch.no_grad():
-                reference = separator.separate_batch(example).cpu().numpy()
-                wrapped = wrapper(example).cpu().numpy()
-                traced_result = traced(example).cpu().numpy()
-            actual = model.predict({'mixture': example.numpy()})['stems']
-            for stage, value in [('wrapper', wrapped), ('trace', traced_result), ('coreml', actual)]:
-                if (value.shape != (1, 64000, 2) or not np.isfinite(value).all()
-                        or not np.isfinite(reference).all()
-                        or not np.allclose(reference, value, rtol=1e-3, atol=1e-3)):
-                    raise ValueError(f'{label}: {stage} disagrees with official separate_batch')
-            checks.append({'case': label, 'passed': True, 'maxAbsoluteError': float(np.max(np.abs(reference-actual))),
-                           'hostSeconds': time.perf_counter()-started})
+            actual = model.predict({'mixture': mixture_numpy})['stems']
+            if (actual.shape != (1, 64000, 2) or not np.isfinite(actual).all()
+                    or not np.allclose(reference, actual, rtol=1e-3, atol=1e-3)):
+                raise ValueError(f'{label}: coreml disagrees with official separate_batch')
+            checks.append({'case': label, 'passed': True,
+                           'maxAbsoluteError': float(np.max(np.abs(reference-actual))),
+                           'hostSeconds': preconversion_seconds + time.perf_counter()-started})
+            print(f'Core ML parity passed: {label}', flush=True)
         report = {'source': MODEL, 'revision': REVISION, 'sourceSHA256': source_hashes, 'parityPassed': True,
                   'license': 'Apache-2.0', 'shape': [1, 64000, 2], 'checks': checks,
                   'fixturePreparation': fixture_info,
