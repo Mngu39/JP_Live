@@ -224,6 +224,7 @@ struct DeviceValidationReport: Codable, Sendable {
     }
 }
 
+@MainActor
 enum ProductionOrchestrationContract {
     static func run() -> (Bool, String) {
         let capture = UUID()

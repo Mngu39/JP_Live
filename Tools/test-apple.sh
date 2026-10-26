@@ -21,7 +21,25 @@ python3 -B "$ROOT/Tools/source_checksums.py" normalize \
 (cd "$ROOT" && shasum -a 256 -c "$RUN/source-SHA256SUMS.txt") 2>&1 | tee "$RUN/checksums.log"
 python3 -B "$ROOT/Tests/test_source_checksums.py" 2>&1 | tee "$RUN/checksum-tests.log"
 python3 -B "$ROOT/Tests/test_sudachi_resources.py" 2>&1 | tee "$RUN/sudachi-resource-tests.log"
-python3 -B "$ROOT/Tests/test_separator_assets.py" 2>&1 | tee "$RUN/separator-asset-tests.log"
+# Separator tests require the same pinned NumPy/Torch environment used for
+# the actual Core ML conversion. The runner's system python3 does not have
+# these dependencies; do not turn meaningful numerical checks into skips.
+SEPARATOR_TEST_PYTHON=python3
+if [[ "$PHASE" == 2 ]]; then
+  SEPARATOR_TEST_PYTHON=''
+  for candidate in "$ROOT"/BuildOutputs/separator-export.*/python/bin/python; do
+    if [[ -x "$candidate" ]] && "$candidate" -c 'import numpy, torch' >/dev/null 2>&1; then
+      SEPARATOR_TEST_PYTHON="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$SEPARATOR_TEST_PYTHON" ]]; then
+    echo 'Missing prepared SepFormer test Python with numpy/torch; conversion environment is required.' >&2
+    exit 1
+  fi
+fi
+printf 'Separator tests interpreter: %s\n' "$SEPARATOR_TEST_PYTHON" | tee "$RUN/separator-test-environment.log"
+"$SEPARATOR_TEST_PYTHON" -B "$ROOT/Tests/test_separator_assets.py" 2>&1 | tee "$RUN/separator-asset-tests.log"
 python3 -B "$ROOT/Tests/test_diarizer_assets.py" 2>&1 | tee "$RUN/diarizer-asset-tests.log"
 python3 -B "$ROOT/Tests/test_vad_assets.py" 2>&1 | tee "$RUN/vad-asset-tests.log"
 if [[ "$PHASE" == 2 ]]; then

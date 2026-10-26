@@ -453,7 +453,11 @@ actor AudioPreprocessor {
             let recoveryDeadline = ProcessInfo.processInfo.systemUptime + maxAnalysisWait
             while let recovery = analysisRecoveryTask {
                 let remaining = recoveryDeadline - ProcessInfo.processInfo.systemUptime
-                if remaining <= 0 || !(await waitForAnalysisTask(recovery, seconds: remaining)) {
+                var recoveryCompleted = false
+                if remaining > 0 {
+                    recoveryCompleted = await waitForAnalysisTask(recovery, seconds: remaining)
+                }
+                if !recoveryCompleted {
                     analysisGeneration = UUID()
                     analysisRecoveryToken = nil
                     analysisRecoveryTask?.cancel(); analysisRecoveryTask = nil
