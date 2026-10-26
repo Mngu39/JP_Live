@@ -111,6 +111,23 @@ def prepare_upstream_parity_audio(samples, sample_rate, size=64000):
     }
 
 
+def register_coreml_alias_converter(registrar, get_inputs, builder):
+    """Lower TorchScript aten::alias as a value-preserving MIL identity.
+
+    coremltools 8.3 does not register this operator. aten::alias creates an
+    alias/view of its input; in this evaluation-only separator the converted
+    graph does not need a separate mutable storage alias. All numerical
+    predictions are still checked against the upstream SpeechBrain model
+    before a .mlpackage can be published.
+    """
+    @registrar
+    def alias(context, node):
+        value = get_inputs(context, node, expected=1)[0]
+        context.add(builder.identity(x=value, name=node.name))
+
+    return alias
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
@@ -176,11 +193,18 @@ def main():
                  ('impulse', impulse), ('upstream-English-mixture', torch.from_numpy(speech[:64000].copy()).unsqueeze(0))]
         with torch.no_grad():
             traced = torch.jit.trace(wrapper, cases[0][1], check_trace=True)
+        # coremltools 8.3's TorchScript frontend lacks aten::alias support.
+        # Register exactly that value-preserving operator, not a generic
+        # unsupported-op bypass. Keep full upstream-vs-CoreML parity checks.
+        from coremltools.converters.mil.frontend.torch.torch_op_registry import register_torch_op
+        from coremltools.converters.mil.frontend.torch.ops import _get_inputs
+        from coremltools.converters.mil import Builder as mb
+        register_coreml_alias_converter(register_torch_op, _get_inputs, mb)
         model = ct.convert(traced,
             inputs=[ct.TensorType(name='mixture', shape=(1, 64000), dtype=np.float32)],
             outputs=[ct.TensorType(name='stems', dtype=np.float32)], convert_to='mlprogram',
             minimum_deployment_target=ct.target.iOS18, compute_precision=ct.precision.FLOAT32,
-            compute_units=ct.ComputeUnit.CPU_ONLY)
+            compute_units=ct.ComputeUnit.CPU_ONLY, debug=True)
         checks = []
         for label, example in cases:
             started = time.perf_counter()

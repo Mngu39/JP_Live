@@ -198,6 +198,58 @@ class SeparatorAssetsTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     exporter.prepare_upstream_parity_audio(data, rate)
 
+    def test_alias_coreml_registration_is_narrow_and_preserves_value(self):
+        """Execute the exact compatibility callback without requiring CoreML on Linux."""
+        registered = {}
+        sentinel = object()
+        seen = []
+
+        def register(fn):
+            registered[fn.__name__] = fn
+            return fn
+
+        def inputs(context, node, expected):
+            self.assertEqual(expected, 1)
+            self.assertIs(context, instance)
+            self.assertIs(node, graph_node)
+            return [sentinel]
+
+        class Builder:
+            @staticmethod
+            def identity(*, x, name):
+                self.assertIs(x, sentinel)
+                self.assertEqual(name, 'masknet/84')
+                return ('identity', x, name)
+
+        class Context:
+            def add(self, value):
+                seen.append(value)
+
+        class Node:
+            name = 'masknet/84'
+
+        instance, graph_node = Context(), Node()
+        callback = exporter.register_coreml_alias_converter(register, inputs, Builder)
+        self.assertIs(registered['alias'], callback)
+        callback(instance, graph_node)
+        self.assertEqual(seen, [('identity', sentinel, 'masknet/84')])
+
+    def test_torch_alias_in_traced_graph_is_value_preserving(self):
+        import torch
+
+        class Example(torch.nn.Module):
+            def forward(self, data):
+                return torch.ops.aten.alias.default(data) * 3
+
+        data = torch.arange(4, dtype=torch.float32).reshape(1, 4)
+        scripted = torch.jit.trace(Example().eval(), data)
+        self.assertIn('aten::alias', str(scripted.inlined_graph))
+        torch.testing.assert_close(scripted(data), data * 3)
+
+    def test_conversion_debug_reports_all_unsupported_ops(self):
+        source = (TOOLS/'export_separator.py').read_text(encoding='utf-8')
+        self.assertIn('compute_units=ct.ComputeUnit.CPU_ONLY, debug=True)', source)
+
     def test_separator_wrapper_preserves_official_length_adjustment(self):
         source = (TOOLS/'export_separator.py').read_text(encoding='utf-8')
         self.assertIn('requested = mixture.size(1)', source)
