@@ -67,6 +67,50 @@ def assert_pinned_apache_license(card):
         raise ValueError('Pinned model card does not declare Apache-2.0')
 
 
+def prepare_upstream_parity_audio(samples, sample_rate, size=64000):
+    """Make a fixed 16kHz mono input for numerical parity, not a quality score.
+
+    The pinned upstream WAV is an external sample, not a promise that it lasts
+    four seconds. It can be safely padded for a 4s fixed-shape conversion test.
+    Preserve the original metadata so normalization cannot masquerade as a
+    native 4s source recording.
+    """
+    import math
+    import numpy as np
+    from scipy.signal import resample_poly
+
+    samples = np.asarray(samples)
+    original_shape = list(samples.shape)
+    if (samples.ndim not in (1, 2) or samples.size == 0 or
+            (samples.ndim == 2 and (samples.shape[1] < 1 or samples.shape[1] > 8)) or
+            not isinstance(sample_rate, (int, np.integer)) or sample_rate <= 0 or
+            not np.issubdtype(samples.dtype, np.number) or
+            not np.isfinite(samples).all()):
+        raise ValueError(f'Invalid upstream parity WAV: rate={sample_rate}, shape={original_shape}')
+    original_rate = int(sample_rate)
+    channels = samples.shape[1] if samples.ndim == 2 else 1
+    samples = samples.astype(np.float32)
+    if samples.ndim == 2:
+        samples = samples.mean(axis=1, dtype=np.float32)
+    if sample_rate != 16000:
+        divisor = math.gcd(original_rate, 16000)
+        samples = resample_poly(samples, 16000//divisor, original_rate//divisor).astype(np.float32)
+    if samples.size == 0 or not np.isfinite(samples).all() or np.max(np.abs(samples)) == 0:
+        raise ValueError('Upstream parity WAV has no usable audio after conversion')
+    normalized_count = int(samples.size)
+    if normalized_count < size:
+        samples = np.pad(samples, (0, size-normalized_count))
+    else:
+        samples = samples[:size]
+    return samples.astype(np.float32), {
+        'originalRate': original_rate, 'originalShape': original_shape,
+        'originalChannels': int(channels), 'resampledTo': 16000,
+        'availableSamplesAt16k': normalized_count, 'testInputSamples': size,
+        'adaptation': ('zero-padded' if normalized_count < size else
+                       'truncated' if normalized_count > size else 'unaltered'),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
@@ -115,12 +159,18 @@ def main():
             def forward(self, mixture):
                 encoded = self.encoder(mixture)
                 stems = encoded.unsqueeze(0).repeat(2, 1, 1, 1) * self.masknet(encoded)
-                return torch.stack([self.decoder(stems[0]), self.decoder(stems[1])], dim=-1)
+                decoded = torch.stack([self.decoder(stems[0]), self.decoder(stems[1])], dim=-1)
+                # Match SpeechBrain SepformerSeparation.separate_batch: Conv1d
+                # may change T, so restore the requested input time dimension.
+                requested = mixture.size(1)
+                actual = decoded.size(1)
+                if requested > actual:
+                    return torch.nn.functional.pad(decoded, (0, 0, 0, requested-actual))
+                return decoded[:, :requested, :]
 
         wrapper = FixedSeparator(separator).eval()
         speech, rate = sf.read(snapshot/'test_mixture16k.wav', dtype='float32')
-        if rate != 16000 or speech.ndim != 1 or speech.size < 64000 or not np.isfinite(speech).all():
-            raise ValueError('Upstream real-audio parity fixture is not valid 16 kHz mono')
+        speech, fixture_info = prepare_upstream_parity_audio(speech, rate)
         impulse = torch.zeros(1, 64000); impulse[0, 16000] = 0.25
         cases = [('noise', torch.randn(1, 64000)*0.03), ('silence', torch.zeros(1, 64000)),
                  ('impulse', impulse), ('upstream-English-mixture', torch.from_numpy(speech[:64000].copy()).unsqueeze(0))]
@@ -148,6 +198,7 @@ def main():
                            'hostSeconds': time.perf_counter()-started})
         report = {'source': MODEL, 'revision': REVISION, 'sourceSHA256': source_hashes, 'parityPassed': True,
                   'license': 'Apache-2.0', 'shape': [1, 64000, 2], 'checks': checks,
+                  'fixturePreparation': fixture_info,
                   'python': platform.python_version(), 'platform': platform.platform(),
                   'versions': versions,
                   'installedPackages': sorted(f'{d.metadata["Name"]}=={d.version}' for d in importlib.metadata.distributions()),

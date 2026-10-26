@@ -163,5 +163,47 @@ class SeparatorAssetsTests(unittest.TestCase):
         self.assertTrue(output.is_dir())
 
 
+
+    def test_real_audio_fixture_short_mono_is_padded(self):
+        import numpy as np
+        data = np.ones(16000, dtype=np.float32) * 0.125
+        actual, provenance = exporter.prepare_upstream_parity_audio(data, 16000)
+        self.assertEqual(actual.shape, (64000,))
+        self.assertEqual(provenance['adaptation'], 'zero-padded')
+        self.assertTrue(np.all(actual[:16000] == 0.125))
+        self.assertTrue(np.all(actual[16000:] == 0))
+
+    def test_real_audio_fixture_stereo_resamples_and_truncates(self):
+        import numpy as np
+        rate = 48000
+        n = 48000 * 5
+        t = np.arange(n, dtype=np.float32) / rate
+        stereo = np.column_stack((0.1 * np.sin(2*np.pi*220*t),
+                                  0.1 * np.sin(2*np.pi*330*t)))
+        actual, provenance = exporter.prepare_upstream_parity_audio(stereo, rate)
+        self.assertEqual(actual.shape, (64000,))
+        self.assertTrue(np.isfinite(actual).all())
+        self.assertEqual(provenance['originalChannels'], 2)
+        self.assertEqual(provenance['adaptation'], 'truncated')
+        self.assertEqual(provenance['availableSamplesAt16k'], 80000)
+
+    def test_real_audio_fixture_rejects_invalid_input(self):
+        import numpy as np
+        for data, rate in [(np.empty(0, dtype=np.float32), 16000),
+                           (np.array([np.nan]), 16000),
+                           (np.ones(32000, dtype=np.float32), 0),
+                           (np.zeros(32000, dtype=np.float32), 16000),
+                           (np.zeros((100, 9), dtype=np.float32), 16000)]:
+            with self.subTest(rate=rate, shape=data.shape):
+                with self.assertRaises(ValueError):
+                    exporter.prepare_upstream_parity_audio(data, rate)
+
+    def test_separator_wrapper_preserves_official_length_adjustment(self):
+        source = (TOOLS/'export_separator.py').read_text(encoding='utf-8')
+        self.assertIn('requested = mixture.size(1)', source)
+        self.assertIn('torch.nn.functional.pad(decoded, (0, 0, 0, requested-actual))', source)
+        self.assertIn('return decoded[:, :requested, :]', source)
+
+
 if __name__ == '__main__':
     unittest.main()
