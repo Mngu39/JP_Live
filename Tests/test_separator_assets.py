@@ -126,6 +126,27 @@ class SeparatorAssetsTests(unittest.TestCase):
         self.assertIn("python-version: '3.11'", workflow)
         self.assertIn("inputs.phase == '2' && 120 || 45", workflow)
 
+    def test_pinned_card_accepts_hugging_face_quoted_license(self):
+        # Pinned upstream revision 21a5b50 uses: license: "apache-2.0"
+        for declared in ('license: "apache-2.0"', "license: 'apache-2.0'", 'license: apache-2.0'):
+            with self.subTest(declared=declared):
+                exporter.assert_pinned_apache_license('---\nlanguage: "en"\n' + declared + '\n---\n# Model\n')
+
+    def test_pinned_card_rejects_incorrect_missing_or_ambiguous_license(self):
+        rejected = (
+            '---\nlicense: mit\n---\n',
+            '---\nlicense: "apache-2.0\n---\n',
+            '---\nlicense: apache-2.0\nlicense: mit\n---\n',
+            '---\nmetadata:\n  license: apache-2.0\n---\n',
+            '---\nmodel: example\n---\nlicense: apache-2.0\n',
+            'license: apache-2.0\n# No YAML metadata\n',
+            '---\nlicense: apache-2.0\n# Unterminated front matter',
+        )
+        for card in rejected:
+            with self.subTest(card=card):
+                with self.assertRaises(ValueError):
+                    exporter.assert_pinned_apache_license(card)
+
     def test_preflight_fails_on_windows_before_importing_ml_packages(self):
         with patch.object(exporter.platform, 'system', return_value='Windows'):
             with self.assertRaisesRegex(ValueError, 'require macOS'):

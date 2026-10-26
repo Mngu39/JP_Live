@@ -4,6 +4,7 @@ import argparse
 import importlib.metadata
 import json
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,35 @@ def preflight(output, app_resources):
     return versions
 
 
+
+def assert_pinned_apache_license(card):
+    """Check the license field in pinned Hugging Face YAML front matter.
+
+    HF model cards can use either `license: apache-2.0` or
+    `license: "apache-2.0"`.  Keep this strict: a free-text mention of the
+    license outside front matter must not authorize model redistribution.
+    """
+    lines = card.splitlines()
+    if not lines or lines[0].strip() != '---':
+        raise ValueError('Pinned model card lacks YAML front matter')
+    try:
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == '---')
+    except StopIteration as error:
+        raise ValueError('Pinned model card has unterminated YAML front matter') from error
+    declarations = []
+    for line in lines[1:end]:
+        match = re.fullmatch(r'license:[ \t]*(.*?)[ \t]*', line)
+        if match is not None:
+            declarations.append(match.group(1).strip())
+    if len(declarations) != 1:
+        raise ValueError('Pinned model card must have exactly one top-level license declaration')
+    raw = declarations[0]
+    if len(raw) >= 2 and raw[0] in ('"', "'") and raw[-1] == raw[0]:
+        raw = raw[1:-1]
+    if raw.lower() != 'apache-2.0':
+        raise ValueError('Pinned model card does not declare Apache-2.0')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
@@ -62,8 +92,7 @@ def main():
                     allow_patterns=list(SOURCE_FILES), cache_dir=str(args.cache.resolve())))
     source_hashes = {name: file_hash(snapshot/name) for name in SOURCE_FILES}
     card = (snapshot/'README.md').read_text(encoding='utf-8')
-    if 'license: apache-2.0' not in card.lower():
-        raise ValueError('Pinned model card no longer declares the reviewed Apache-2.0 license')
+    assert_pinned_apache_license(card)
     with urllib.request.urlopen('https://www.apache.org/licenses/LICENSE-2.0.txt', timeout=30) as response:
         license_text = response.read().decode('utf-8')
     if 'Apache License' not in license_text or 'Version 2.0' not in license_text:
