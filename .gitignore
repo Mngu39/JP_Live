@@ -1,0 +1,9 @@
+# Local generated caches / intermediates
+__pycache__/
+*.py[cod]
+.DS_Store
+.build/
+BuildOutputs/
+xcuserdata/
+*.xcuserstate
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
