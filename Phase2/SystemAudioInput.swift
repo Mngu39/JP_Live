@@ -115,6 +115,12 @@ final class SystemAudioInput: NSObject, AudioInput {
         throw AppFailure.message("iOS Simulator에서는 화면 캡처를 사용할 수 없습니다.")
     }
 
+    // Keep the simulator and physical-device signatures identical. This
+    // overload is required by AppModel even though capture is unavailable.
+    func captureLearningScreenshot(matchingSentenceStart start: Double, end: Double) async throws -> [String: Any] {
+        throw AppFailure.message("iOS Simulator에서는 화면 캡처를 사용할 수 없습니다.")
+    }
+
     func start() async throws -> AsyncThrowingStream<PCMChunk, Error> {
         throw AppFailure.message("iOS Simulator에서는 시스템 오디오 캡처를 사용할 수 없습니다.")
     }

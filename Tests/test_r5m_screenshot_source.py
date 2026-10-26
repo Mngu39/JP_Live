@@ -34,6 +34,14 @@ class S1SourceContract(unittest.TestCase):
         self.assertIn("app.learningScreenshot(for: current)", popup)
         self.assertIn("SavePayload.make", popup)
 
+    def test_simulator_and_device_share_study_screenshot_signature(self):
+        text = source("Phase2/SystemAudioInput.swift")
+        simulator, device = text.split("#if targetEnvironment(simulator)", 1)[1].split("#else", 1)
+        signature = "func captureLearningScreenshot(matchingSentenceStart start: Double, end: Double) async throws -> [String: Any]"
+        self.assertIn(signature, simulator)
+        self.assertIn(signature, device)
+        self.assertIn("throw AppFailure.message", simulator)
+
     def test_device_validation_uses_unrestricted_probe(self):
         text = source("Phase2/SystemAudioInput.swift")
         self.assertIn("func captureLearningScreenshot() async throws", text)

@@ -272,7 +272,54 @@ class SeparatorAssetsTests(unittest.TestCase):
         self.assertEqual(len(reference_calls), 1)
         self.assertLess(reference_calls[0].lineno, convert[0].lineno)
         self.assertIn('Core ML conversion returned; checking converted-model parity', source)
-        self.assertIn('np.allclose(reference, actual, rtol=1e-3, atol=1e-3)', source)
+        self.assertIn('compare_coreml_audio(reference, actual)', source)
+
+    def test_coreml_audio_parity_accepts_high_fidelity_speech(self):
+        import numpy as np
+        t = np.linspace(0, 1, 64000, dtype=np.float64)
+        reference = np.zeros((1, 64000, 2), dtype=np.float32)
+        reference[0, :, 0] = 0.6 * np.sin(2 * np.pi * 350 * t)
+        reference[0, :, 1] = 0.4 * np.sin(2 * np.pi * 530 * t)
+        actual = reference.copy()
+        actual[0, :, 0] += 0.0001 * np.sin(2 * np.pi * 49 * t)
+        passed, detail = exporter.compare_coreml_audio(reference, actual)
+        self.assertTrue(passed, detail)
+        self.assertEqual(len(detail['channels']), 2)
+
+    def test_coreml_audio_parity_rejects_wrong_stem_or_spike(self):
+        import numpy as np
+        t = np.linspace(0, 1, 64000, dtype=np.float64)
+        reference = np.zeros((1, 64000, 2), dtype=np.float32)
+        reference[0, :, 0] = 0.3 * np.sin(2 * np.pi * 350 * t)
+        reference[0, :, 1] = 0.3 * np.sin(2 * np.pi * 530 * t)
+        for wrong in (reference[..., ::-1].copy(), reference * 0.8,
+                      np.full_like(reference, np.nan)):
+            ok, _ = exporter.compare_coreml_audio(reference, wrong)
+            self.assertFalse(ok)
+        spike = reference.copy(); spike[0, 1000, 0] += 0.1
+        ok, _ = exporter.compare_coreml_audio(reference, spike)
+        self.assertFalse(ok)
+
+    def test_coreml_audio_parity_silent_stem_stays_silent(self):
+        import numpy as np
+        reference = np.zeros((1, 64000, 2), dtype=np.float32)
+        noisy = reference.copy(); noisy[0, :, 1] = 0.002
+        ok, _ = exporter.compare_coreml_audio(reference, noisy)
+        self.assertFalse(ok)
+        ok, _ = exporter.compare_coreml_audio(reference, reference.copy())
+        self.assertTrue(ok)
+
+    def test_sudachi_uses_ci_python_311_not_runner_default(self):
+        root = TOOLS.parent
+        bash = (root/'Tools/build-sudachi-macos.sh').read_text()
+        workflow = (root/'.github/workflows/apple-validation.yml').read_text()
+        self.assertIn('python3.11 -m venv', bash)
+        self.assertNotIn('python3 -m venv', bash)
+        job = workflow.split('  phase2-source-compile:', 1)[1]
+        self.assertIn("python-version: '3.11'", job)
+        reqs = (root/'Tools/separator-requirements.txt').read_text()
+        self.assertIn('torch==2.5.0', reqs)
+        self.assertIn('torchaudio==2.5.0', reqs)
 
     def test_conversion_uses_saved_numpy_inputs_after_torch_reference(self):
         # Reject regression to PyTorch Tensor.numpy() inside post-convert parity.
