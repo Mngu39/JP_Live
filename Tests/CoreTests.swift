@@ -1209,10 +1209,19 @@ final class CoreTests: XCTestCase {
         metrics.recordSpeechAppend(frames: 288000)
         metrics.recordAnalyzerInput(buffer: secondAnalyzer, startTime: CMTime(seconds: 5, preferredTimescale: 16000))
         metrics.recordPipelineMetrics(AudioMetrics(rmsDB: -18, peakDB: -3))
-        metrics.recordSpeechResult(final: true, observedAt: 16.5)
+        // A session-wide PASS also requires real, correctly timed STT text.
+        // Counter-only callbacks intentionally produce a speech_results WARNING.
+        metrics.recordSpeechResult(text: "正常。", final: true, start: 5, end: 6,
+                                   finalizedThrough: 6,
+                                   timedSpans: [.init(utf16Start: 0, utf16End: "正常。".utf16.count,
+                                                      start: 5, end: 6)], observedAt: 16.5)
 
         let report = metrics.finish(userStopped: true, endedAt: Date(timeIntervalSince1970: 11), endedUptime: 21)
         XCTAssertEqual(report.verdict, .pass)
+        XCTAssertEqual(report.semanticSpeechResults, 1)
+        XCTAssertEqual(report.invalidTimedSpeechResults, 0)
+        XCTAssertTrue(report.checks.contains { $0.name == "speech_results" && $0.verdict == .pass })
+        XCTAssertTrue(report.checks.contains { $0.name == "speech_timed_span_integrity" && $0.verdict == .pass })
         XCTAssertEqual(report.screenshotContinuity.verdict, .pass)
         XCTAssertTrue(report.screenshotContinuity.rawWindowCompleted)
         XCTAssertTrue(report.screenshotContinuity.processedWindowCompleted)
