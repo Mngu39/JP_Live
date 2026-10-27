@@ -102,10 +102,6 @@ if [[ "$PHASE" == 2 ]]; then
   test -s "$RESOLVED"
   cp "$RESOLVED" "$RUN/Package.resolved"
 fi
-run_xcodebuild -project "$PROJECT" -scheme JPLive -configuration Debug \
-  -destination "platform=iOS Simulator,id=$DESTINATION_ID" \
-  -derivedDataPath "$RUN/DerivedData" -resultBundlePath "$RUN/tests.xcresult" \
-  -parallel-testing-enabled NO test CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$RUN/tests.log"
 run_xcodebuild -project "$PROJECT" -scheme JPLive -configuration Release \
   -destination 'generic/platform=iOS' \
   -derivedDataPath "$RUN/DeviceDerivedData" build CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$RUN/device-build.log"
@@ -128,6 +124,13 @@ if [[ "$PHASE" == 2 ]]; then
   /usr/bin/unzip -tq "$RUN/JPLive-unsigned.ipa" >/dev/null
   shasum -a 256 "$RUN/JPLive-unsigned.ipa" > "$RUN/JPLive-unsigned.ipa.sha256"
 fi
+# Build and package the actual arm64 iPad app before simulator XCTest. Tests remain mandatory
+# for PASS; a test failure now leaves device-build/IPA evidence for diagnosis rather
+# than concealing whether the deliverable can compile and link at all.
+run_xcodebuild -project "$PROJECT" -scheme JPLive -configuration Debug \
+  -destination "platform=iOS Simulator,id=$DESTINATION_ID" \
+  -derivedDataPath "$RUN/DerivedData" -resultBundlePath "$RUN/tests.xcresult" \
+  -parallel-testing-enabled NO test CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$RUN/tests.log"
 echo "PASS: Phase $PHASE Apple compile, simulator XCTest, unsigned device build" | tee "$RUN/PASS.txt"
 if [[ "$PHASE" == 2 ]]; then echo "Unsigned IPA packaged for later re-sign/install validation: $RUN/JPLive-unsigned.ipa" | tee -a "$RUN/PASS.txt"; fi
 echo "Evidence: $RUN"

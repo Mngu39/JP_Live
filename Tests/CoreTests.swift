@@ -339,15 +339,6 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
-
-
-    @MainActor
-
-
-    @MainActor
-
-
-    @MainActor
     func testSeparationEOFConsidersFinalRowsWithoutLoadingMissingPCM() async {
         var timeline = SpeechTimeline()
         timeline.append((0..<3).map { .init(speechProbability: 0.9, activeSpeakers: 2,
@@ -1846,11 +1837,6 @@ final class CoreTests: XCTestCase {
 
 
     @MainActor
-
-
-    @MainActor
-
-
     func testLiveInputBacklogCountsInFlightAudioAndReturnsToZero() {
         let progress = AudioInputProgress()
         let first = Self.pcm(count: 4800, time: 7)
@@ -2493,9 +2479,6 @@ final class CoreTests: XCTestCase {
         return PCMChunk(buffer: buffer, time: time)
     }
 }
-
-@MainActor
-
 
 private actor SuspendedPreparation {
     private var continuation: CheckedContinuation<Void, Never>?
