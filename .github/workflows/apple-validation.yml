@@ -16,7 +16,6 @@ permissions:
   contents: read
 jobs:
   validate:
-    if: inputs.phase != '2' || inputs.phase2_mode == 'full'
     runs-on: ${{ inputs.phase == '2' && 'xcode-27' || 'macos-26' }}
     timeout-minutes: ${{ inputs.phase == '2' && 120 || 45 }}
     steps:
@@ -32,18 +31,19 @@ jobs:
         with:
           python-version: '3.11'
       - name: Prepare and verify required bundled live diarizer
-        if: inputs.phase == '2'
+        if: inputs.phase == '2' && inputs.phase2_mode == 'full'
         run: bash Tools/prepare-diarizer-macos.sh
       - name: Prepare and verify required bundled separator VAD
-        if: inputs.phase == '2'
+        if: inputs.phase == '2' && inputs.phase2_mode == 'full'
         run: bash Tools/prepare-vad-macos.sh
       - name: Prepare and verify required two-speaker separator
-        if: inputs.phase == '2'
+        if: inputs.phase == '2' && inputs.phase2_mode == 'full'
         run: bash Tools/prepare-separator-macos.sh
       - name: Compile and run native regression tests
+        if: inputs.phase != '2' || inputs.phase2_mode == 'full'
         run: bash Tools/test-apple.sh '${{ inputs.phase }}'
       - name: Preserve diagnostics and test results
-        if: always()
+        if: always() && (inputs.phase != '2' || inputs.phase2_mode == 'full')
         uses: actions/upload-artifact@v4
         with:
           name: apple-validation-phase-${{ inputs.phase }}
@@ -68,25 +68,14 @@ jobs:
             BuildOutputs/VAD/source.json
             BuildOutputs/VAD/licenses/**
           if-no-files-found: warn
-
-  phase2-source-compile:
-    if: inputs.phase == '2' && inputs.phase2_mode == 'compile-only'
-    runs-on: xcode-27
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Metal Toolchain
-        run: xcodebuild -downloadComponent MetalToolchain
-      - name: Set up Python 3.11 for required Sudachi native framework
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
       - name: Build required Sudachi native framework
+        if: inputs.phase == '2' && inputs.phase2_mode == 'compile-only'
         run: |
           set -euo pipefail
           mkdir -p BuildOutputs/compile-smoke
           bash Tools/build-sudachi-macos.sh 2>&1 | tee BuildOutputs/compile-smoke/sudachi-build.log
       - name: Prepare explicitly nonfunctional placeholder model resources
+        if: inputs.phase == '2' && inputs.phase2_mode == 'compile-only'
         run: |
           set -euo pipefail
           for directory in Separation Diarization VAD; do
@@ -94,6 +83,7 @@ jobs:
             printf 'COMPILE SMOKE ONLY; no model is bundled here\n' > "BuildOutputs/$directory/COMPILE_ONLY_NOT_A_MODEL.txt"
           done
       - name: Resolve packages and compile the actual Phase 2 Swift target
+        if: inputs.phase == '2' && inputs.phase2_mode == 'compile-only'
         run: |
           set -euo pipefail
           mkdir -p BuildOutputs/compile-smoke
@@ -104,7 +94,7 @@ jobs:
             -skipPackagePluginValidation build CODE_SIGNING_ALLOWED=NO ARCHS=arm64 2>&1 | tee BuildOutputs/compile-smoke/build.log
           echo 'PASS: Swift simulator build with nonfunctional placeholder models; this is NOT a deployable app' | tee BuildOutputs/compile-smoke/PASS.txt
       - name: Preserve independent compile diagnostics
-        if: always()
+        if: always() && inputs.phase == '2' && inputs.phase2_mode == 'compile-only'
         uses: actions/upload-artifact@v4
         with:
           name: phase2-source-compile
