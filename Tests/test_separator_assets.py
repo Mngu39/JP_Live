@@ -315,8 +315,16 @@ class SeparatorAssetsTests(unittest.TestCase):
         workflow = (root/'.github/workflows/apple-validation.yml').read_text()
         self.assertIn('python3.11 -m venv', bash)
         self.assertNotIn('python3 -m venv', bash)
-        job = workflow.split('  phase2-source-compile:', 1)[1]
-        self.assertIn("python-version: '3.11'", job)
+        # R5Z uses one validate job for both full and compile-only. Python
+        # 3.11 must be configured for Phase 2 before either path runs.
+        self.assertIn('  validate:\n', workflow)
+        self.assertNotIn('  phase2-source-compile:\n', workflow)
+        job = workflow.split('  validate:\n', 1)[1]
+        setup = job.split('      - name: Set up Python 3.11 for required separator conversion\n', 1)[1].split('      - name:', 1)[0]
+        self.assertIn("if: inputs.phase == '2'", setup)
+        self.assertIn('uses: actions/setup-python@v5', setup)
+        self.assertIn("python-version: '3.11'", setup)
+        self.assertIn("if: inputs.phase == '2' && inputs.phase2_mode == 'compile-only'", job)
         reqs = (root/'Tools/separator-requirements.txt').read_text()
         self.assertIn('torch==2.5.0', reqs)
         self.assertIn('torchaudio==2.5.0', reqs)
