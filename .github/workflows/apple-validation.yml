@@ -70,7 +70,7 @@ jobs:
           if-no-files-found: warn
 
   phase2-source-compile:
-    if: inputs.phase == '2'
+    if: inputs.phase == '2' && inputs.phase2_mode == 'compile-only'
     runs-on: xcode-27
     timeout-minutes: 90
     steps:
@@ -101,7 +101,7 @@ jobs:
           xcodebuild -project Phase2/JPLive.xcodeproj -scheme JPLive -configuration Debug \
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath BuildOutputs/compile-smoke/DerivedData \
-            -skipPackagePluginValidation build CODE_SIGNING_ALLOWED=NO 2>&1 | tee BuildOutputs/compile-smoke/build.log
+            -skipPackagePluginValidation build CODE_SIGNING_ALLOWED=NO ARCHS=arm64 2>&1 | tee BuildOutputs/compile-smoke/build.log
           echo 'PASS: Swift simulator build with nonfunctional placeholder models; this is NOT a deployable app' | tee BuildOutputs/compile-smoke/PASS.txt
       - name: Preserve independent compile diagnostics
         if: always()
