@@ -1784,6 +1784,7 @@ final class CoreTests: XCTestCase {
         let changed = buffer.applySpeakerTimeline(timeline)
         XCTAssertEqual(changed, [buffer.rows[0].id])
         XCTAssertEqual(buffer.rows[0].speaker, 2)
+        XCTAssertTrue(buffer.applySpeakerTimeline(timeline).isEmpty)
     }
 
     func testLateSpeakerTimelineUpdatesVisibleCaptionWithoutHoldingSTT() {
@@ -1991,6 +1992,9 @@ final class CoreTests: XCTestCase {
         _ = buffer.receive("。」", final: true, start: 1, end: 1.1, speaker: nil, now: 0.1)
         XCTAssertEqual(buffer.rows.first?.source, "今日は。」")
         XCTAssertTrue(buffer.rows.first?.isFinal == true)
+        XCTAssertTrue(SentenceBoundary.hasStrongEnding("今日は。」"))
+        XCTAssertFalse(SentenceBoundary.hasStrongEnding("今日は」"))
+        XCTAssertEqual(SentenceBoundary.firstCompletedSentencePrefixUTF16Length(in: "今日は。」", language: .japanese), "今日は。」".utf16.count)
     }
 
     func testOneAppleTimingRunAcrossTwoSentencesSurvivesOnBothRows() {

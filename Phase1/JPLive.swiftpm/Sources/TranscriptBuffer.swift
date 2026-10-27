@@ -312,6 +312,13 @@ struct TranscriptBuffer {
     // never determines a sentence boundary.
     mutating func applySpeakerTimeline(_ timeline: SpeechTimeline) -> [UUID] {
         var changed: [UUID] = []
+        // The unfinished sentence is already a visible row. refreshDraft() rebuilds
+        // it from stable/volatile source and may change its speaker before the row
+        // comparison below. Preserve its pre-update metadata so the caller receives
+        // its ID when late diarization changes what the user can see.
+        let previousDraft = draftID.flatMap { id in
+            rows.first(where: { $0.id == id && $0.captureID == captureID && !$0.isFinal })
+        }
         for index in stable.indices {
             let fragment = stable[index]
             if timeline.decision(start: fragment.start, end: fragment.end) != nil {
@@ -344,6 +351,15 @@ struct TranscriptBuffer {
             rows[index].speakerSpans = spans
             rows[index].revision += 1
             changed.append(rows[index].id)
+        }
+        if let previousDraft,
+           let updatedDraft = rows.first(where: { $0.id == previousDraft.id && !$0.isFinal }),
+           (previousDraft.speaker != updatedDraft.speaker ||
+            previousDraft.speakerSpans != updatedDraft.speakerSpans),
+           !changed.contains(previousDraft.id) {
+            // `changed` is assembled in reverse row order. The draft is the newest
+            // row, so it must come first before we restore chronological order.
+            changed.insert(previousDraft.id, at: 0)
         }
         return Array(changed.reversed())
     }

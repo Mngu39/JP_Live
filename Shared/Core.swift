@@ -255,8 +255,11 @@ struct SentenceBoundary {
     }
     static func hasStrongEnding(_ text: String) -> Bool {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let last = t.last else { return false }
-        return "。！？.!?…".contains(last)
+        // Closing quotation marks are part of a sentence-ending suffix, not a
+        // reason to leave an otherwise complete sentence provisional.
+        let closers: Set<Character> = ["」", "』", "”", "’", "\"", "）", ")", "]", "】", "］"]
+        guard let lastContent = t.last(where: { !closers.contains($0) }) else { return false }
+        return "。！？.!?…".contains(lastContent)
     }
 
     // UTF-16 lengths of the complete leading sentences. The final tokenizer token is

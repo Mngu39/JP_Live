@@ -429,7 +429,10 @@ struct SoftSpeakerMapper {
         auxiliary = Track(slot: slot, tint: primary?.tint == .first ? .second : .first,
                           lastSeen: end, speech: duration,
                           observations: duration > 0 ? 1 : 0)
-        return .neutral
+        // One contiguous interval may already exceed the confidence threshold.
+        // Requiring a second callback would make gutter colors depend on the
+        // recognizer's arbitrary caption/chunk segmentation.
+        return resolvedHint(slot: slot)
     }
 
     private mutating func uniqueEvidence(slot: Int, start: Double, end: Double) -> Bool {
